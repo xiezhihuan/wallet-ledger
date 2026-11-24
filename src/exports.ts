@@ -21,7 +21,7 @@ export function toCsv(store: Store, f: Filter): string {
 export function toJson(store: Store, f: Filter): string {
   const r = store.list({ ...f, page: 1, pageSize: 100_000 });
   const ids = r.items.map((b) => b.id);
-  const changes = ids.length ? store.db.all(`SELECT * FROM bill_changes WHERE bill_id IN (${ids.map(() => '?').join(',')}) ORDER BY id`, ...ids).map((c) => ({ ...c, fields: JSON.parse(c.fields) })) : [];
-  const reviews = ids.length ? store.db.all(`SELECT * FROM bill_reviews WHERE bill_id IN (${ids.map(() => '?').join(',')}) ORDER BY id`, ...ids) : [];
+  const changes = ids.length ? store.db.all(`SELECT * FROM bill_changes WHERE bill_id IN (SELECT value FROM json_each(?)) ORDER BY id`, JSON.stringify(ids)).map((c) => ({ ...c, fields: JSON.parse(c.fields) })) : [];
+  const reviews = ids.length ? store.db.all(`SELECT * FROM bill_reviews WHERE bill_id IN (SELECT value FROM json_each(?)) ORDER BY id`, JSON.stringify(ids)) : [];
   return JSON.stringify({ exported_at: fmtTime(Date.now()), timezone: 'Asia/Shanghai', amount_unit: 'fen', total: r.total, sum: r.sum, bills: r.items.map(({ thumb: _t, author: _a, capture: _c, ...b }) => ({ ...b, occurred: fmtTime(b.occurred_at), kind_name: KIND[b.kind as keyof typeof KIND], status_name: STATUS[b.status] })), changes, reviews }, null, 2);
 }

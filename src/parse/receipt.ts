@@ -4,7 +4,7 @@ import { parseStamp } from './when.js';
 
 export type Kind = 'expense' | 'income' | 'refund' | 'transfer' | 'repay';
 /** 没把握的字段。hard = 影响金额口径，必须用户确认后才计入统计 */
-export interface Flag { field: 'amount' | 'kind' | 'merchant' | 'time' | 'method' | 'category' | 'evidence'; hard: boolean; reason: string; candidates?: number[] }
+export interface Flag { field: 'amount' | 'kind' | 'merchant' | 'time' | 'method' | 'category' | 'evidence' | 'review'; hard: boolean; reason: string; candidates?: number[] }
 export interface ListRow { currency?: string; amount: number | null; kind: Kind; direction: string; merchant: string; ms: number | null; precise: boolean; note: string; skip: boolean; sure: boolean }
 export interface TradeId { type: 'trade' | 'order' | 'mch'; no: string }
 export interface Receipt {

@@ -60,8 +60,8 @@ try {
   // 3 连发两张不同付款 → 拆开
   await say('新建', /新的一笔/); const n3 = mock.sent.length;
   const i3 = await image(alipayDetail({ merchant: '绿禾超市', amount: '-86.35', rows: [['支付时间', stamp(t0 - 7200_000)], ['付款方式', '花呗'], ['订单号', '2026110622001412345678901234']] })), i4 = await image(wechatDetail({ merchant: '云衣服饰旗舰店', amount: '-129.00', time: cn(t0 - 9000_000), method: '零钱', trade: '4200002988202611011111222233' }));
-  mock.say(U, '', { attachments: [i3] }); mock.say(U, '', { attachments: [i4] });
-  await reply(/这次有 2 笔/, n3); ok('两张不同付款自动拆成两笔');
+  mock.say(U, '', { attachments: [i3] }); await reply(/已记 #2/, n3); await say('新建', /新的一笔/); mock.say(U, '', { attachments: [i4] });
+  await reply(/已记 #3/, n3); ok('新建动作隔开两笔付款');
 
   // 4 退款、转账、列表、模糊、疑似重复
   await say('新建', /./); assert.match(await say('', /已记 #4/, { attachments: [await image(wechatDetail({ merchant: '云衣服饰旗舰店-退款', amount: '+129.00', state: '已全额退款', time: cn(t0), timeLabel: '退款时间', method: '零钱', trade: '4200002988202611011111222233', extra: [['退款方式', '原路退回']] }))] }), /原支出：#3/);
@@ -98,7 +98,7 @@ try {
 
   // 8 记一笔（网页上传截图）、搜索、删除恢复、预算
   await p.getByRole('button', { name: '记一笔' }).first().click(); await p.getByLabel('一句话记账').fill('理发 45 昨天'); await p.getByRole('button', { name: '记下来' }).click(); await p.getByText('¥45.00').first().waitFor();
-  await p.getByRole('button', { name: '删除' }).click(); await p.locator('dialog').getByRole('button', { name: '删除' }).click(); await p.getByText('已在回收站').waitFor(); await p.getByRole('button', { name: '恢复' }).click(); await p.getByText('已恢复').waitFor();
+  await p.getByRole('button', { name: '删除' }).click(); await p.locator('dialog').getByRole('button', { name: '删除' }).click(); await p.getByText('已在回收站').waitFor(); await p.getByRole('button', { name: '恢复', exact: true }).click(); await p.getByText('已恢复').waitFor();
   await p.goto(a.url + '/#/bills'); await p.getByLabel('搜索').fill('4200002988202611031234567890'); await p.keyboard.press('Enter'); await until(async () => (await p.locator('a.bill').count()) === 1, '按截图里的单号搜索');
   await p.goto(a.url + '/#/settings'); await p.getByPlaceholder('每月金额').fill('100'); await p.locator('section.card', { hasText: '每月预算' }).getByRole('button', { name: '保存' }).click(); await p.getByText(/超支/).first().waitFor();
   ok('一句话记账、删除恢复、按截图文字搜索、预算超支提示');
@@ -106,7 +106,7 @@ try {
   // 9 导出、导入、备份恢复
   await p.goto(a.url + '/#/bills'); const [dl] = await Promise.all([p.waitForEvent('download'), p.getByRole('link', { name: 'CSV' }).click()]); const csv = fs.readFileSync((await dl.path())!, 'utf8'); assert.ok(csv.startsWith('﻿编号')); assert.equal(csv.trim().split('\r\n').length - 1, a.store.list({ pageSize: 999 }).total);
   await p.goto(a.url + '/#/import'); await p.locator('input[type=file]').setInputFiles({ name: '微信支付账单.csv', mimeType: 'text/csv', buffer: Buffer.from(WECHAT) }); await p.getByRole('button', { name: /入账 \d+ 笔/ }).waitFor(); await p.screenshot({ path: path.join(OUT, 'e2e-import.png'), fullPage: true }); const before = a.store.counts().total; await p.getByRole('button', { name: /入账 \d+ 笔/ }).click(); await p.waitForURL(/import=/); assert.ok(a.store.counts().total > before);
-  await p.goto(a.url + '/#/settings'); await p.getByRole('button', { name: '现在备份' }).click(); await p.getByText('已备份').waitFor(); const keep = a.store.counts().total; a.store.remove(1, '测试'); await p.reload(); await p.locator('.row', { hasText: '手动' }).getByRole('button', { name: '恢复' }).click(); await p.locator('dialog').getByRole('button', { name: '恢复' }).click(); await p.getByText('已恢复，之前的状态存为').waitFor(); assert.equal(a.store.counts().total, keep);
+  await p.goto(a.url + '/#/settings'); await p.getByRole('button', { name: '现在备份' }).click(); await p.getByText('已备份').waitFor(); const keep = a.store.counts().total; a.store.remove(1, '测试'); await p.reload(); await p.locator('.row', { hasText: '手动' }).getByRole('button', { name: '恢复', exact: true }).click(); await p.locator('dialog').getByRole('button', { name: '恢复', exact: true }).click(); await p.getByText('已恢复，之前的状态存为').waitFor(); assert.equal(a.store.counts().total, keep);
   ok('CSV 导出、微信账单导入预览入账、备份与恢复');
 
   // 10 MCP

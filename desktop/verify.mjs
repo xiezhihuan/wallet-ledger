@@ -104,6 +104,24 @@ try {
     assert.equal(JSON.parse(s.content[0].text).net_spend,total);
     const detail = await client.callTool({name:'get_bill',arguments:{id:Number(id)}});
     assert.equal(JSON.parse(detail.content[0].text).category,'餐饮/外卖');
+    const bill=JSON.parse(detail.content[0].text);
+    const image=await client.callTool({name:'get_attachment',arguments:{id:bill.attachments[0].id}});
+    assert.ok(image.content.some(block=>block.type==='image'));
+    await demo.getByPlaceholder('单笔编号').fill(id);
+    await demo.getByRole('button',{name:'签发授权码'}).click();
+    const grant=await demo.locator('.mono').filter({hasText:/^wla_/}).innerText();
+    const args={id:Number(id),authorization_code:grant,expected_version:bill.version,reason:'包内合成复核',amount:'29.00'};
+    const preview=await client.callTool({name:'update_bill',arguments:args});
+    assert.equal(JSON.parse(preview.content[0].text).changed_fields.amount.after,2900);
+    const result=await client.callTool({name:'update_bill',arguments:{...args,preview:false,request_id:'package-correction'}});
+    assert.equal(JSON.parse(result.content[0].text).detail.amount,2900);
+    await demo.goto(origin+'/#/bills/'+id);
+    await demo.getByRole('button',{name:'恢复到之前'}).first().click();
+    await demo.locator('dialog').getByRole('button',{name:'恢复',exact:true}).click();
+    await demo.getByText('已恢复',{exact:true}).waitFor();
+    const restored=await client.callTool({name:'get_bill',arguments:{id:Number(id)}});
+    assert.equal(JSON.parse(restored.content[0].text).amount,'28.00');
+    console.log('通过：包内 MCP 取图、预览、受控改账与网页恢复');
   } finally { await client.close(); }
   console.log('通过：重新绑定模拟 QQ、两条消息归一、包内 OCR、改分类、统计、导出、MCP 对账');
 } finally {

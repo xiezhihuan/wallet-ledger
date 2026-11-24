@@ -36,7 +36,7 @@ test('MCP 受控修改、版本冲突、幂等、复核与完整日志', async (
     const log = await call('get_change_log', { id: billId });
     assert.ok(log.data.changes.length >= 2);
     assert.ok(log.data.changes.some((c: any) => c.source === 'mcp' && c.fields.amount.after === 3000));
-    const reviewed = await call('review_bill', { id: billId, result: 'ok', note: '金额已核对' });
+    const reviewed = await call('review_bill', { id: billId, result: 'ok', authorization_code: auth.code, note: '金额已核对' });
     assert.equal(reviewed.data.result, 'ok');
     const queue = await call('list_review_queue', { never_reviewed: false, page_size: 20 });
     assert.equal(queue.data.total, 0);

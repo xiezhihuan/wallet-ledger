@@ -43,27 +43,26 @@ run('同一笔的多张图（支付成功页 + 账单详情 + 订单详情）合
   assert.equal(live(e).length, 1, r); const b = bill(e, 1);
   assert.deepEqual([b.amount, b.merchant, b.method], [2850, '渝味小面（高新店）', '零钱']); assert.equal(e.app.store.detail(1).evidence.length, 3); assert.equal(e.app.store.categoryName(b.category_id), '餐饮/外卖');
 });
-run('连发两张不同付款的截图：自动拆开，说明跟着对应的图走，素材不丢', async (e) => {
+run('连发两张不同付款的截图：同笔待确认，素材不丢', async (e) => {
   sendShot(e, shot(wx('老街牛肉面馆', '-28.00', T(100), '4200002988202611030000000001')));
   sendShot(e, shot(wx('城市地铁', '-5.00', T(50), '4200002988202611030000000002')));
   e.mock.say(U, '去机场接人');
-  const r = await e.reply(/这次有 2 笔/); await idle(e);
-  assert.match(r, /已记 #1[\s\S]*¥28\.00[\s\S]*已记 #2[\s\S]*¥5\.00/); assert.match(r, /并入 2 1/);
-  assert.deepEqual(live(e).map((b) => [b.amount, b.status, b.note]), [[2800, 'ok', ''], [500, 'ok', '去机场接人']]);
+  await e.reply(/#1 待确认/); await idle(e);
+  assert.equal(live(e).length,1); assert.equal(bill(e,1).note,'去机场接人'); assert.equal(e.app.store.detail(1).evidence.length,3);
 });
-run('一条消息里两张不同付款的图也拆开；同金额不同商户、同金额不同单号不误并', async (e) => {
+run('一条消息里两张图归一笔；只有新建才切换', async (e) => {
   sendShot(e, [shot(wx('老街牛肉面馆', '-20.00', T(100), '4200002988202611030000000011')), shot(wx('蓝山便利店', '-20.00', T(50), '4200002988202611030000000012'))]);
-  await e.reply(/这次有 2 笔/); await idle(e); assert.equal(live(e).length, 2);
+  await e.reply(/#1/); await idle(e); assert.equal(live(e).length, 1);
   e.mock.say(U, '新建');
   sendShot(e, shot(wx('小满咖啡', '-19.90', T(40), '4200002988202611030000000013'))); sendShot(e, shot(wx('小满咖啡', '-19.90', T(20), '4200002988202611030000000014')));
-  await until(() => live(e).length === 4 && live(e).every((b) => b.amount)); await idle(e);
+  await until(() => live(e).length === 2 && live(e).every((b) => b.amount)); await idle(e);
   assert.ok(live(e).every((b) => b.status === 'ok'), JSON.stringify(live(e).map((b) => [b.status, b.dup_why])));
 });
-run('图与文字先后到、识别慢：文字金额与截图不同则另立一笔；相同则合并', async (e) => {
+run('图与文字先后到、识别慢：金额冲突待确认；相同则可入账', async (e) => {
   sendShot(e, shot(wx('老街牛肉面馆', '-28.00', T1, '4200002988202611030000000021'))); e.mock.say(U, '打车 35.5');
-  await e.reply(/这次有 2 笔/); await idle(e); assert.deepEqual(live(e).map((b) => [b.amount, b.item]), [[2800, ''], [3550, '打车']]);
+  await e.reply(/#1 待确认/); await idle(e); assert.deepEqual(live(e).map((b) => [b.amount, b.item]), [[2800, '打车']]);
   e.mock.say(U, '新建'); e.mock.say(U, '咖啡 19.9'); sendShot(e, shot(['支付成功', '小满咖啡', { big: '¥19.90' }, ['付款方式', '零钱通']]));
-  await e.reply(/已记 #3/); await idle(e); assert.equal(live(e).length, 3); assert.deepEqual([bill(e, 3).merchant, bill(e, 3).item, bill(e, 3).amount], ['小满咖啡', '咖啡', 1990]);
+  await e.reply(/已记 #2/); await idle(e); assert.equal(live(e).length, 2); assert.deepEqual([bill(e, 2).merchant, bill(e, 2).item, bill(e, 2).amount], ['小满咖啡', '咖啡', 1990]);
 }, {}, { ocr: fakeOcr(150) });
 run('同一条消息里文字金额与截图不一致：不猜，标待确认并给出候选', async (e) => {
   sendShot(e, shot(wx('老街牛肉面馆', '-56.00', T1, '4200002988202611030000000031')), '午饭我出 28');
@@ -71,11 +70,11 @@ run('同一条消息里文字金额与截图不一致：不猜，标待确认并
   assert.equal(e.app.intake.stats.totals({ from: '2020-01-01', to: '2029-01-01' }).net, 0);
   await cmd(e, '改 28', /✅ #1 支出 ¥28\.00/); assert.equal(bill(e, 1).status, 'ok');
 });
-run('两句带金额的文字是两笔；只有金额的短句不覆盖已有金额', async (e) => {
-  e.mock.say(U, '早饭 5'); e.mock.say(U, '午饭 28.5'); await e.reply(/这次有 2 笔/);
-  assert.deepEqual(live(e).map((b) => b.amount), [500, 2850]);
-  e.mock.say(U, '新建'); sendShot(e, shot(wx('小满咖啡', '-19.90', T1, '4200002988202611030000000041'))); await e.reply(/已记 #3/);
-  e.mock.say(U, '25'); await e.reply(/已是 ¥19\.90，没有改成 ¥25\.00/); assert.equal(bill(e, 3).amount, 1990);
+run('两句带金额的文字仍是一笔；只有金额的短句不覆盖已有金额', async (e) => {
+  e.mock.say(U, '早饭 5'); e.mock.say(U, '午饭 28.5'); await e.reply(/#1 待确认/);
+  assert.deepEqual(live(e).map((b) => b.amount), [500]);
+  e.mock.say(U, '新建'); sendShot(e, shot(wx('小满咖啡', '-19.90', T1, '4200002988202611030000000041'))); await e.reply(/已记 #2/);
+  e.mock.say(U, '25'); await e.reply(/已是 ¥19\.90，没有改成 ¥25\.00/); assert.equal(bill(e, 2).amount, 1990);
 });
 run('相对日期；记账途中单发「昨天」只改日期', async (e) => {
   e.mock.say(U, '打车 35.5 昨天'); await e.reply(/已记 #1/); e.mock.say(U, '新建'); e.mock.say(U, '电影 79.8'); await e.reply(/已记 #2/);
@@ -86,11 +85,11 @@ run('语音转写记账', async (e) => {
   e.mock.say(U, '', { attachments: [{ content_type: 'voice', filename: 'v.silk', url: e.mock.base + '/file/none', asr_refer_text: '奶茶十五块' }] });
   const r = await e.reply(/已记 #1/); assert.match(r, /¥15\.00/); assert.match(r, /来自语音转写/);
 });
-run('合并窗口可配置，以平台时间戳为准；超时另起', async (e) => {
+run('录入跨越闲置时长仍是一笔；新建才开启下一笔', async (e) => {
   const t = Date.now();
   e.mock.say(U, '看牙', { at: t - 20 * 60_000 }); e.mock.say(U, '130', { at: t - 18 * 60_000 }); e.mock.say(U, '医保外', { at: t });
-  await e.reply(/#2/); assert.equal(bill(e, 1).amount, 13000); assert.equal(live(e).length, 2);
-  e.app.store.saveSetting('merge_window_min', '0'); e.mock.say(U, '新建'); e.mock.say(U, 'A店', { at: t + 1000 }); e.mock.say(U, 'B店', { at: t + 2000 }); await until(() => live(e).length === 4);
+  await e.reply(/#1/); assert.equal(bill(e, 1).amount, 13000); assert.equal(live(e).length, 1);
+  e.app.store.saveSetting('merge_window_min', '0'); e.mock.say(U, '新建'); e.mock.say(U, 'A店', { at: t + 1000 }); e.mock.say(U, 'B店', { at: t + 2000 }); await until(() => bill(e, 2).note.includes('B店'));
 });
 run('引用消息或回执补充；指定编号补充；引用没收录过的消息连原文一起记', async (e) => {
   const a = e.mock.say(U, '午饭 28'); await e.reply(/已记 #1/); e.mock.say(U, '新建'); e.mock.say(U, '打车 35'); await e.reply(/已记 #2/);
@@ -163,11 +162,11 @@ run('账单列表逐行列出，确认后入账；疑似重复的行默认跳过
   assert.equal(e.app.intake.stats.totals({ from: '2020-01-01', to: '2029-01-01' }).net, 2800 + 1990 + 1760); await cmd(e, '忽略', /不入账/); assert.equal(bill(e, 2).status, 'batch_done');
   await cmd(e, '入账 全部', /没有待入账/); assert.equal(e.app.store.detail(3).evidence.length, 1, '入账的账能看到原列表截图');
 });
-run('列表与付款截图连发：列表单独待确认，不混进付款', async (e) => {
+run('列表与付款截图连发：保留三份材料，仍仅一笔', async (e) => {
   sendShot(e, shot(wx('老街牛肉面馆', '-28.00', T(500), '4200002988202611030000000111')));
   sendShot(e, shot(['账单', ['A店', '-1.00'], [T(30).slice(0, 16), ''], ['B店', '-2.00'], [T(40).slice(0, 16), '']]));
   sendShot(e, shot(wx('城市地铁', '-5.00', T(50), '4200002988202611030000000112')));
-  await e.reply(/这次有 3 笔/); await idle(e); assert.deepEqual(live(e).map((b) => [b.status, b.amount]).sort(), [['batch', null], ['ok', 2800], ['ok', 500]].sort());
+  await e.reply(/#1 待确认/); await idle(e); assert.equal(live(e).length,1); assert.equal(e.app.store.detail(1).evidence.length,3);
 });
 run('模糊 / 未付款 / 看不出金额：待确认、不计入，确认或改金额后才计入', async (e) => {
   sendShot(e, shot(['账单详情', '看不清商店', { big: '-88.80', c: 0.6 }, ['支付方式', '零钱']])); await e.reply(/#1 待确认/);
@@ -190,7 +189,7 @@ run('断线重连、停机补发、识别途中重启：不丢不重', async (e)
   for (let i = 0; i < 60; i++) { e.mock.say(U, `新建 第${i}笔 ${i + 1}`); if (i % 7 === 3) { e.mock.closeSocket(4009); await until(() => e.mock.online); } }
   await until(() => live(e).length === 60, '60 笔'); assert.equal(e.app.store.db.get('SELECT SUM(amount) s FROM bills')!.s, (60 * 61 / 2) * 100);
   await e.app.close(); // 停机期间继续发
-  e.mock.say(U, '新建 停机时发的 77'); sendShot(e, shot(wx('老街牛肉面馆', '-28.00', T1, '4200002988202611030000000121')), '', {});
+  e.mock.say(U, '新建 停机时发的 77'); e.mock.say(U,'新建'); sendShot(e, shot(wx('老街牛肉面馆', '-28.00', T1, '4200002988202611030000000121')), '', {});
   await e.restart(); await until(() => live(e).some((b) => b.amount === 7700) && live(e).some((b) => b.merchant === '老街牛肉面馆'), '补发');
   assert.equal(live(e).length, 62);
 });
@@ -214,7 +213,7 @@ run('异常附件：下载失败重试、伪装图片、超大、内网地址、
 }, { maxAttachmentBytes: 2 * 1024 * 1024 });
 run('并发：多人、连发多图交错，互不串账', async (e) => {
   const V = 'F'.repeat(32); e.app.store.db.run('INSERT INTO qq_users(openid,bound_at) VALUES(?,1)', V);
-  for (let i = 0; i < 12; i++) { sendShot(e, shot(wx(`商户${i}号店`, `-${i + 1}.00`, T(600 - i * 20), `42000029882026110300000${1000 + i}`))); e.mock.say(V, `新建 另一人${i} ${100 + i}`); }
+  for (let i = 0; i < 12; i++) { e.mock.say(U,'新建'); sendShot(e, shot(wx(`商户${i}号店`, `-${i + 1}.00`, T(600 - i * 20), `42000029882026110300000${1000 + i}`))); e.mock.say(V, `新建 另一人${i} ${100 + i}`); }
   await until(() => live(e).length === 24 && live(e).every((b) => b.amount !== null), '24 笔', 10_000); await idle(e);
   const mine = live(e).filter((b) => b.author === U), his = live(e).filter((b) => b.author === V);
   assert.equal(mine.length, 12); assert.equal(mine.reduce((n, b) => n + b.amount, 0), 7800); assert.equal(his.reduce((n, b) => n + b.amount, 0), (1200 + 66) * 100);
@@ -229,11 +228,10 @@ run('账单列表关闭后仍可重新打开；撤回列表截图不留残余', 
 run('加好友欢迎语', async (e) => { e.mock.emit('FRIEND_ADD', { openid: 'N'.repeat(32) }, 'evt-x'); await e.reply(/我是截图账本/); });
 void at;
 
-run('同一窗口再次上传原图要裁决，网关重投同一消息仍幂等', async (e) => {
+run('同一窗口再次上传原图保留两份素材，网关重投同一消息仍幂等', async (e) => {
   const buf = shot(wx('合成书店', '-16.90', T1, 'SYNTHETIC11112222'));
   sendShot(e, buf); await e.reply(/已记 #1/);
-  sendShot(e, buf); await e.reply(/#2 疑似与 #1 重复/);
-  await cmd(e, '重复', /只算一次/);
+  sendShot(e, buf); await until(() => e.app.store.detail(1).evidence.length === 2); await idle(e);
   assert.equal(e.app.store.detail(1).evidence.length, 2);
   assert.equal(live(e).length, 1);
 });

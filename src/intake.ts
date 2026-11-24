@@ -23,7 +23,7 @@ interface Cursor { capture: string; at: number; closed: boolean; focus?: number 
 
 export const HELP = `💰 截图账本
 把付款截图发给我，或直接打字：午饭 28、打车 35.5 昨天。
-连着发的几条算同一笔；金额、单号不同会自动分开。
+从一次发起记账到「完成」期间收到的截图、文字和语音转写都归同一笔；不会按图片数量、金额、商户或单号自动拆分。要另记发「新建」，要拆分在网页或发「拆分」。
 
 【这一笔】
 改 28.5 — 改金额
@@ -48,7 +48,7 @@ type Cmd = { name: string; id?: number; arg: string };
 const SUB: Record<string, string> = { 金额: 'amount', 价格: 'amount', 分类: 'category', 类别: 'category', 时间: 'time', 日期: 'time', 备注: 'note', 商户: 'merchant', 商家: 'merchant', 说明: 'item', 名称: 'item', 支付: 'method', 支付方式: 'method', 付款方式: 'method', 类型: 'kind' };
 const SUBS = Object.keys(SUB).sort((a, b) => b.length - a.length).join('|');
 const ALIAS: Record<string, string> = { '?': '帮助', '？': '帮助', help: '帮助', 菜单: '帮助', 结束: '完成', 撤回: '撤销', undo: '撤销', 是重复: '重复', 不是重复: '不重复', 全部入账: '入账', 待处理: '待确认', 合并: '并入', 搜: '查', 搜索: '查', 查询: '查', 记一笔: '新建', 另记: '新建', 不入账: '忽略', 分类规则: '规则' };
-const BARE = /^(新建|完成|结束|撤销|撤回|拆分|帮助|菜单|help|\?|？|待确认|待处理|确认|重复|是重复|不重复|不是重复|全部入账|入账|忽略|不入账|删除|预算|规则|分类规则|撤销规则|分类列表|补充)$/i;
+const BARE = /^(新建|另记|记一笔|完成|结束|撤销|撤回|拆分|帮助|菜单|help|\?|？|待确认|待处理|确认|重复|是重复|不重复|不是重复|全部入账|入账|忽略|不入账|删除|预算|规则|分类规则|撤销规则|分类列表|补充)$/i;
 const WITH_ID = /^(确认|删除|恢复|详情|重复|是重复|不重复|不是重复|并入|合并|忽略|关联|完成|撤销规则)\s*#?\s*(\d{1,9})(?:\s+#?(\d{1,9}))?$/;
 const QUERY = /^(今天|今日|昨天|昨日|前天|[本这上]个?(?:周|星期|礼拜|月|季度?)|当月|今年|本年|去年)\s*(?:我|一共|总共|都)?\s*(?:花了?多少钱?|花到?哪(?:里|儿)?了?|花哪(?:里|儿)?了?|钱花哪(?:里|儿)?了?|花销|花费|支出|消费|统计|账单|汇总|情况)?\s*(?:了)?[?？!！。]?$/;
 
@@ -121,7 +121,7 @@ export class Intake {
     return this.db.get('SELECT r.bill_id id FROM qq_refs r JOIN bills b ON b.id=r.bill_id WHERE r.ref=? AND b.deleted_at IS NULL', ref)?.id;
   }
 
-  private inWindow(m: Incoming): boolean { const c = this.cursor(m.openid); return !!c && !c.closed && Math.abs(m.sentAt - c.at) <= this.mergeWindowMs; }
+  private inWindow(m: Incoming): boolean { const c = this.cursor(m.openid); return !!c && !c.closed; }
   /** @param target 明确指定的账；'new' 强制新建；undefined 按合并窗口判断 */
   private record(m: Incoming, target: number | 'new' | undefined, text = m.text, dedupe = true): Outcome {
     const c = this.cursor(m.openid), inWindow = target !== 'new' && this.inWindow(m);

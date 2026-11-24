@@ -1,3 +1,4 @@
+import { recordOperation, stateColumns } from './journal.js';
 import crypto from 'node:crypto';
 import type { Db, Row } from './db.js';
 import { money } from './money.js';
@@ -78,6 +79,9 @@ export class Store {
   private dirty = new Map<string, Set<number>>();
   constructor(readonly db: Db, readonly now: () => number = Date.now) {}
 
+  record<T>(actor: string, reason: string, fn: () => T, source = actor === '网页' ? 'web' : 'qq', grant: number | null = null): T {
+    return recordOperation(this.db, this.now(), source, actor, reason, fn, grant);
+  }
   // ───────── 设置 ─────────
   setting(key: string, def = ''): string { return this.db.kvGet(`set:${key}`) ?? def; }
   saveSetting(key: string, v: string): void { this.db.kvSet(`set:${key}`, v); }
@@ -95,7 +99,7 @@ export class Store {
    * @param target 明确指定的账；'new' 强制新建；undefined 归到 cur（合并窗口内的当前账）或按内容拆开
    */
   addMessage(m: NewMessage, capture: string, cur: number | null, target?: number | 'new'): { messageId: number; bill: number; hints: string[] } {
-    return this.db.tx(() => {
+    return this.record(m.author, '收录原始材料', () => {
       const { id: messageId } = this.db.run('INSERT INTO messages(channel,dedupe_key,author,kind,text,raw,capture,sent_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
         m.channel, m.dedupeKey ?? null, m.author, 'entry', m.text, m.raw === undefined ? null : JSON.stringify(m.raw), capture, m.sentAt, this.now());
       const evs: number[] = [];
@@ -117,7 +121,7 @@ export class Store {
       // 截图没有下载地址，直接按失败处理，不会一直「识别中」
       for (const e of this.evidence(bill)) if (e.att_kind === 'image' && e.att_status === 'failed' && !e.parsed) this.evaluate(e.attachment_id!, null);
       return { messageId, bill, hints };
-    });
+    }, m.channel);
   }
   private packText(e: TextEntry): TextParsed { return { ...e.receipt, bare: e.bare, override: e.override }; }
 
@@ -142,6 +146,16 @@ export class Store {
     if (pinned) { this.setBill(evId, cur!, true); this.refresh(cur!); return cur!; }
     if (cur === null) { const b = fresh(); this.setBill(evId, b); this.refresh(b); return b; }
     const b = this.require(cur);
+    // QQ 录入按“发起到结束”的动作窗口归为一笔。OCR 完成后也不能因为
+    // 金额、商户或交易号不同而自动拆账，用户可在网页或用明确的拆分指令处理。
+    if (m.channel === 'qq' && !p?.bare) {
+      if (b.status === 'batch' && !JSON.parse(b.batch).some((row: BatchRow) => row.done)) {
+        this.db.run("UPDATE bills SET status='pending',batch=NULL WHERE id=?", cur);
+      }
+      this.setBill(evId, cur, true);
+      this.refresh(cur);
+      return cur;
+    }
     if (!p || p.amount === null) { // 未识别的图、无金额的文字
       // 账单列表、疑似重复：后面的截图另起，不混进去
       if (!p && e.att_kind === 'image' && b.status === 'batch') { const n = fresh(); this.setBill(evId, n); this.refresh(n); return n; }
@@ -185,7 +199,7 @@ export class Store {
 
   /** 图片识别完成（doc 为 null 表示没能识别）。返回受影响的账。 */
   evaluate(attachmentId: number, doc: OcrDoc | null): number[] {
-    return this.db.tx(() => {
+    return this.record('本地 OCR', '识别附件 #'+attachmentId, () => {
       const touched = new Set<number>();
       for (const { id } of this.db.all('SELECT id FROM evidence WHERE attachment_id=?', attachmentId)) {
         const e = this.ev(id);
@@ -194,11 +208,16 @@ export class Store {
         else { r = { doc: 'none', platform: '', kind: 'expense', direction: '', amount: null, sure: false, currency: 'CNY', merchant: '', merchantSure: false, item: '', ms: null, precise: false, method: '', ids: [], flags: [{ field: 'amount', hard: true, reason: '截图没能识别' }] }; }
         this.db.run('UPDATE evidence SET parsed=? WHERE id=?', JSON.stringify(r), id);
         if (!e.bill_id) continue;
-        const capture = this.require(e.bill_id).capture as string;
-        if (r.doc === 'list' && r.rows) { touched.add(this.toBatch(id, r.rows)); touched.add(e.bill_id); } else if (e.pinned) { this.refresh(e.bill_id); touched.add(e.bill_id); } else for (const b of this.recluster(e.bill_id, capture)) touched.add(b);
+        const b = this.require(e.bill_id);
+        const qq = this.db.get('SELECT channel FROM messages WHERE id=?', e.message_id)?.channel === 'qq';
+        if (r.doc === 'list' && r.rows && (!qq || this.evidence(b.id).length === 1)) {
+          touched.add(this.toBatch(id, r.rows)); touched.add(b.id);
+        } else if (e.pinned || qq) {
+          this.refresh(b.id); touched.add(b.id);
+        } else for (const affected of this.recluster(b.id, b.capture)) touched.add(affected);
       }
       return [...touched].filter((b) => !this.require(b).deleted_at);
-    });
+    }, this.db.get('SELECT m.channel FROM attachments a JOIN messages m ON m.id=a.message_id WHERE a.id=?', attachmentId)?.channel ?? 'system');
   }
 
   /** 一笔账里混进了别的付款时拆开：先发的留下，后发的另立；后面紧跟的说明跟着走。 */
@@ -246,7 +265,7 @@ export class Store {
   }
   /** 列表入账。pick 为 null 表示「全部」：跳过疑似重复与未成交的行。 */
   commitBatch(id: number, pick: number[] | null, actor: string): { created: number[]; skipped: { n: number; why: string }[] } {
-    return this.db.tx(() => {
+    return this.record(actor, '列表入账', () => {
       const b = this.require(id);
       if (b.status !== 'batch') throw new UserError(`#${id} 不是待确认的账单列表`);
       const rows = JSON.parse(b.batch) as BatchRow[], created: number[] = [], skipped: { n: number; why: string }[] = [];
@@ -274,16 +293,20 @@ export class Store {
   }
   /** 关闭列表：剩余行不入账（原图和识别结果仍保留，可重新打开） */
   closeBatch(id: number, actor: string): void {
+    return this.record(actor, '关闭列表', () => {
     const b = this.require(id);
     if (b.status !== 'batch') throw new UserError(`#${id} 不是待确认的账单列表`);
     this.db.run(`UPDATE bills SET status='batch_done' WHERE id=?`, id);
     this.event(id, actor, '关闭列表', '剩余行未入账');
+    });
   }
   reopenBatch(id: number, actor: string): void {
+    return this.record(actor, '重新打开列表', () => {
     const b = this.require(id);
     if (b.status !== 'batch_done') throw new UserError('不是已处理的账单列表');
     this.db.run(`UPDATE bills SET status='batch' WHERE id=?`, id);
     this.event(id, actor, '重新打开列表');
+    });
   }
 
   // ───────── 账目 ─────────
@@ -308,15 +331,19 @@ export class Store {
       // 金额
       let main: { e: Ev; r: TextParsed } | undefined = sure[0];
       if (main) {
-        const tx = tAmt.find((x) => x.e.message_id === main!.e.message_id && !x.r.bare && x.r.amount !== main!.r.amount);
+        const tx = tAmt.find((x) => (b.source === 'qq' || x.e.message_id === main!.e.message_id) && !x.r.bare && x.r.amount !== main!.r.amount);
         if (tx) flags.push({ field: 'amount', hard: true, reason: `你写的是 ${money(tx.r.amount, tx.r.currency)}，截图是 ${money(main.r.amount, main.r.currency)}`, candidates: [tx.r.amount!, main.r.amount!] });
         const extra = [...new Set(sure.filter((x) => x.r.amount !== main!.r.amount).map((x) => x.r.amount!))];
-        if (extra.length) flags.push({ field: 'evidence', hard: false, reason: `附加凭证的金额 ${extra.map((c) => money(c)).join('、')} 与本笔不同，没有改动金额` });
-      } else if ((main = tSure[0])) { /* 文字明确说了金额 */ }
+        if (extra.length) flags.push({ field: 'amount', hard: true, reason: `附加凭证的金额 ${extra.map((c) => money(c)).join('、')} 与本笔不同，没有改动金额` });
+      } else if ((main = tSure[0])) {
+        const amounts = [...new Set(tSure.map(x => x.r.amount!))];
+        if (amounts.length > 1) flags.push({field:'amount',hard:true,reason:'同一次录入的文字有不同金额',candidates:amounts});
+      }
       else if ((main = iAmt[0] ?? tAmt[0])) flags.push(...main.r.flags.filter((f) => f.field === 'amount'));
       else flags.push({ field: 'amount', hard: true, reason: waiting ? '截图识别中' : img.flatMap((x) => x.r.flags).find((f) => f.field === 'amount')?.reason ?? '没有金额' });
       if (main?.r.flags.some((f) => f.field === 'amount' && !f.hard)) flags.push(...main.r.flags.filter((f) => f.field === 'amount' && !f.hard));
       if (!locked.has('amount')) { set.amount = main?.r.amount ?? null; set.currency = main?.r.currency ?? 'CNY'; }
+      if (all.some(x => x.r.doc === 'list')) flags.push({field:'amount',hard:true,reason:'截图包含多笔明细，请核对这一笔的金额'});
       // 类型
       const kr = (iAmt[0] ?? tAmt[0] ?? all[0])?.r;
       if (!locked.has('kind') && kr) { set.kind = kr.kind; set.direction = kr.direction; flags.push(...img.flatMap((x) => x.r.flags.filter((f) => f.field === 'kind')).slice(0, 1)); }
@@ -368,6 +395,7 @@ export class Store {
     const dup = n.amount === null && !JSON.parse(n.ids).length && !shas.length ? null : this.findDup({ ...(n as any), ids: (JSON.parse(n.ids) as { no: string }[]).map((i) => i.no), shas }, id, dupOk);
     n.dup_of = dup?.id ?? null; n.dup_why = dup?.why ?? '';
 
+    if (locked.has('review')) flags.push({field:'review',hard:true,reason:'用户标记为待确认'});
     const hard = flags.some((f) => f.hard);
     n.status = dup ? 'dup' : hard || n.amount === null ? 'pending' : 'ok';
     this.db.run(`UPDATE bills SET amount=?,currency=?,kind=?,direction=?,occurred_at=?,day=?,time_src=?,merchant=?,item=?,note=?,method=?,ids=?,trade_no=?,refund_of=?,category_id=?,category_src=?,category_why=?,dup_of=?,dup_why=?,flags=?,status=?,updated_at=? WHERE id=?`,
@@ -424,7 +452,7 @@ export class Store {
   }
   /** 用户判定：是重复 → 素材并到原账、本笔进回收站；不是 → 正常入账。 */
   resolveDup(id: number, same: boolean, actor: string): number {
-    return this.db.tx(() => {
+    return this.record(actor, '处理疑似重复', () => {
       const b = this.require(id);
       if (b.status !== 'dup' || !b.dup_of) throw new UserError(`#${id} 没有待处理的重复提示`);
       const to = b.dup_of as number;
@@ -522,7 +550,7 @@ export class Store {
   }
   /** 删除分类：账和规则移到 moveTo（不给则账变成未分类、规则删除）。 */
   deleteCategory(id: number, moveTo: number | null, actor: string): void {
-    this.db.tx(() => {
+    return this.record(actor, '删除分类并迁移账目', () => {
       const c = this.db.get('SELECT * FROM categories WHERE id=?', id);
       if (!c) throw new UserError('分类不存在', 404);
       const ids = [id, ...this.categories().filter((x) => x.parent_id === id).map((x) => x.id)];
@@ -556,6 +584,7 @@ export class Store {
   }
   /** 按现有规则重新归类（不动人工改过分类的账），返回改动数。 */
   reclassify(subject?: string): number {
+    return this.record('网页', '重新归类', () => {
     let n = 0;
     for (const b of this.db.all(`SELECT id,category_id,locked,merchant,item FROM bills WHERE status IN ('ok','pending','dup')`)) {
       if (JSON.parse(b.locked).includes('category_id') || (subject && normName(b.merchant || b.item) !== normName(subject))) continue;
@@ -563,22 +592,23 @@ export class Store {
       this.db.tx(() => { this.refresh(b.id); const after = this.require(b.id).category_id; if (after !== before) { n++; this.event(b.id, '系统', '重新归类', `${this.categoryName(before)} → ${this.categoryName(after)}`); } });
     }
     return n;
+    });
   }
 
   // ───────── 修改 ─────────
   /** 返回记住的规则（改分类时）。 */
   update(id: number, patch: Row, actor: string, learn = true, options: UpdateOptions = {}): { rule?: Row; changed: string[]; version: number } {
-    return this.db.tx(() => {
+    const result = this.record(actor, options.reason ?? '修改账单', () => {
       const b = this.require(id), locked = new Set<string>(JSON.parse(b.locked));
+      if (b.deleted_at) throw new UserError('账单已删除');
       if (options.expectedVersion !== undefined && Number(b.version ?? 1) !== options.expectedVersion) throw new UserError(`版本已变化，当前版本为 ${b.version ?? 1}，请重新读取后再改`, 409);
       if (b.status === 'batch' || b.status === 'batch_done') { if (Object.keys(patch).some((k) => k !== 'note')) throw new UserError('账单列表不能直接改，请先入账'); }
       const out: { rule?: Row; changed: string[]; version: number } = { changed: [], version: Number(b.version ?? 1) };
-      const changes: Record<string, { before: unknown; after: unknown }> = {};
       for (const [k, raw] of Object.entries(patch)) {
-        if (!(k in FIELD)) throw new UserError(`不支持的字段：${k}`);
+        if (!Object.hasOwn(FIELD,k)) throw new UserError(`不支持的字段：${k}`);
         let v: any = raw;
         if (k === 'amount') { if (!Number.isSafeInteger(v) || v <= 0 || v > 1e11) throw new UserError('金额须大于 0'); }
-        else if (k === 'kind') { if (!(v in KIND)) throw new UserError('类型无效'); }
+        else if (k === 'kind') { if (!Object.hasOwn(KIND,v)) throw new UserError('类型无效'); }
         else if (k === 'occurred_at') { if (!Number.isSafeInteger(v) || !validDay(ymd(v))) throw new UserError('时间无效'); }
         else if (k === 'category_id') { if (v !== null && !this.categories().some((c) => c.id === v)) throw new UserError('分类不存在'); }
         else if (k === 'status') { if (!['ok', 'pending'].includes(String(v))) throw new UserError('待确认状态无效'); v = String(v); }
@@ -588,7 +618,7 @@ export class Store {
             const o = this.require(Number(v)), kind = patch.kind ?? b.kind;
             if (kind !== 'refund') throw new UserError('只有退款能关联原支出');
             if (o.kind !== 'expense' || o.deleted_at || o.id === id) throw new UserError(`#${o.id} 不是可关联的支出`);
-            if (o.currency !== b.currency) throw new UserError('币种不同，不能关联');
+            if (o.currency !== (patch.currency ?? b.currency)) throw new UserError('币种不同，不能关联');
             v = o.id;
           }
         } else {
@@ -598,45 +628,40 @@ export class Store {
           if (k === 'currency' && !/^[A-Z]{3}$/.test(v)) throw new UserError('币种应为三位字母');
           if (k === 'direction' && !['', 'in', 'out'].includes(v)) throw new UserError('方向无效');
         }
-        if (k === 'status') { if (v === 'pending') locked.add('review'); }
+        if (k === 'status' && v === 'ok' && (b.status === 'dup' || (patch.amount ?? b.amount) === null)) throw new UserError('须先确认重复关系并填写金额');
+        if (k === 'status') { if (v === 'pending') locked.add('review'); else locked.delete('review'); }
         else if (k !== 'confirmed') locked.add(k === 'currency' ? 'amount' : k);
         if (k === 'kind') locked.add('direction');
         if (b[k] === v) { if (k === 'status') throw new UserError('待确认状态没有变化'); continue; }
-        changes[k] = { before: b[k], after: v };
         out.changed.push(k);
-        this.db.run(`UPDATE bills SET ${k}=? WHERE id=?`, v, id);
+        // Derive status only after all fields have been validated and written.
+        if (k !== 'status') this.db.run(`UPDATE bills SET ${k}=? WHERE id=?`, v, id);
         if (k === 'occurred_at') this.db.run(`UPDATE bills SET day=?, time_src='manual' WHERE id=?`, ymd(v), id);
         if (k === 'kind') this.db.run('UPDATE bills SET direction=? WHERE id=?', v === 'income' || v === 'refund' ? 'in' : 'out', id);
         if (k === 'category_id') this.db.run(`UPDATE bills SET category_src='manual', category_why='手动选择' WHERE id=?`, id);
         this.event(id, actor, `修改${FIELD[k]}`, `${this.show(k, b[k], b)} → ${this.show(k, v, { ...b, ...patch })}`);
       }
       this.db.run('UPDATE bills SET locked=? WHERE id=?', JSON.stringify([...locked]), id);
-      const after = this.require(id), subject = after.merchant || after.item;
-      if (learn && patch.category_id && b.category_id !== patch.category_id && subject && ['expense', 'income', 'refund'].includes(after.kind)) {
+      const afterForRule = this.require(id), subject = afterForRule.merchant || afterForRule.item;
+      if (learn && patch.category_id && b.category_id !== patch.category_id && subject && ['expense', 'income', 'refund'].includes(afterForRule.kind)) {
+        const previous = this.rules(true).concat(this.rules()).find(r => r.match === 'merchant' && normName(r.pattern) === normName(clip(subject,60)));
         const rid = this.saveRule({ match: 'merchant', pattern: clip(subject, 60), category_id: patch.category_id, source: 'learned' });
-        out.rule = { id: rid, pattern: subject, category: this.categoryName(patch.category_id), others: this.sameSubject(subject, id) };
+        out.rule = { id: rid, bill_id:id, previous_category:previous?.category_id ?? null, category_id:patch.category_id, pattern: subject, category: this.categoryName(patch.category_id), others: this.sameSubject(subject, id) };
         this.event(id, '系统', '记住分类', `「${subject}」→ ${out.rule.category}`);
       }
+      if (patch.status === 'ok') this.db.run('UPDATE bills SET confirmed=1 WHERE id=?', id);
       this.refresh(id);
       if (patch.status === 'pending') {
         const now = this.require(id), flags = JSON.parse(now.flags) as any[];
         if (!flags.some((f) => f.field === 'review')) flags.push({ field: 'review', hard: true, reason: '用户标记为待确认' });
         this.db.run('UPDATE bills SET status=\'pending\', flags=?, updated_at=? WHERE id=?', JSON.stringify(flags), this.now(), id);
-      } else if (patch.status === 'ok') {
-        const now = this.require(id), flags = (JSON.parse(now.flags) as any[]).filter((f) => f.field !== 'review');
-        this.db.run('UPDATE bills SET flags=?, status=?, confirmed=1, updated_at=? WHERE id=?', JSON.stringify(flags), now.amount === null || flags.some((f) => f.hard) ? 'pending' : 'ok', this.now(), id);
-      }
-      if (out.changed.length) {
-        const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
-        this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
-        out.version = afterVersion;
-        this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)',
-          id, this.now(), options.source ?? (actor === '网页' ? 'web' : actor === '系统' ? 'system' : actor === '导入' ? 'import' : actor === 'MCP' ? 'mcp' : 'qq'), actor,
-          options.reason ?? '修改账单', beforeVersion, afterVersion, options.authorizationId ?? null, JSON.stringify(changes));
+      } else if (patch.status === 'ok' && this.require(id).status !== 'ok') {
+        throw new UserError('须先解决金额或重复疑问');
       }
       for (const r of this.db.all('SELECT id FROM bills WHERE refund_of=? AND deleted_at IS NULL', id)) this.refresh(r.id);
       return out;
-    });
+    }, options.source, options.authorizationId);
+    return { ...result, version: this.require(id).version };
   }
   /** 同一商户里分类不同、没被人工改过的账有多少 */
   private sameSubject(subject: string, except: number): number {
@@ -654,24 +679,22 @@ export class Store {
   }
   /** 确认：接受当前识别结果。金额为空时不能确认。 */
   confirm(id: number, actor: string): void {
-    this.db.tx(() => {
+    return this.record(actor, '确认账单', () => {
       const b = this.require(id);
       if (b.status === 'dup') throw new UserError(`#${id} 疑似与 #${b.dup_of} 重复，请先判断是否重复`);
       if (b.amount === null) throw new UserError(`#${id} 还没有金额，请先补金额`);
       if (b.status.startsWith('batch')) throw new UserError('账单列表请用「入账」');
       const locked = new Set<string>(JSON.parse(b.locked));
+      locked.delete('review');
       for (const k of ['amount', 'kind']) locked.add(k);
       this.db.run('UPDATE bills SET confirmed=1, locked=? WHERE id=?', JSON.stringify([...locked]), id);
-      const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
-      this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
-      this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '确认账单', beforeVersion, afterVersion, null, JSON.stringify({ confirmed: { before: b.confirmed, after: 1 } }));
       this.event(id, actor, '确认', `${KIND[b.kind as Kind]} ${money(b.amount, b.currency)}`);
       this.refresh(id);
     });
   }
   /** 把一份素材移到另一笔；target 为 null 时新立一笔。 */
   moveEvidence(evId: number, target: number | null, actor: string): number {
-    return this.db.tx(() => {
+    return this.record(actor, '移动素材', () => {
       const e = this.ev(evId);
       if (!e.bill_id) throw new UserError('素材不在任何账里', 404);
       const from = this.require(e.bill_id);
@@ -694,6 +717,7 @@ export class Store {
     });
   }
   merge(from: number, to: number, actor: string): void {
+    return this.record(actor, '合并账单', () => {
     if (from === to) throw new UserError('不能并入自己');
     this.db.tx(() => {
       const a = this.require(from), b = this.require(to);
@@ -709,10 +733,11 @@ export class Store {
       this.remove(from, actor);
       this.refresh(to);
     });
+    });
   }
   /** 撤销某人最近一条消息的素材（保留原始记录）。 */
   undoLast(capture: string, author: string): { text: string; bills: number[]; removed: number[] } | null {
-    return this.db.tx(() => {
+    return this.record(author, '撤回素材', () => {
       const m = this.db.get(`SELECT m.id,m.text FROM messages m WHERE m.capture=? AND m.author=? AND m.kind='entry' AND EXISTS(SELECT 1 FROM evidence e WHERE e.message_id=m.id AND e.bill_id IS NOT NULL) ORDER BY m.id DESC LIMIT 1`, capture, author);
       if (!m) return null;
       const bills = this.db.all('SELECT DISTINCT bill_id id FROM evidence WHERE message_id=? AND bill_id IS NOT NULL', m.id).map((r) => r.id as number), removed: number[] = [];
@@ -732,16 +757,18 @@ export class Store {
     try { return (JSON.parse(this.db.get('SELECT raw FROM messages WHERE id=?', messageId)?.raw ?? 'null')?.message_scene?.ext as string[] | undefined)?.find((e) => e.startsWith('msg_idx='))?.slice(8); } catch { return undefined; }
   }
   remove(id: number, actor: string): void {
+    return this.record(actor, '删除账单', () => {
     const b = this.require(id); if (b.deleted_at) return;
     this.db.run('UPDATE bills SET deleted_at=?, updated_at=? WHERE id=?', this.now(), this.now(), id);
-    const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
-    this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
-    this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '删除账单', beforeVersion, afterVersion, null, JSON.stringify({ deleted_at: { before: null, after: this.require(id).deleted_at } }));
     this.event(id, actor, '删除');
     for (const r of this.db.all(`SELECT id FROM bills WHERE dup_of=? AND deleted_at IS NULL AND status='dup'`, id)) this.refresh(r.id);
+    });
   }
   restore(id: number, actor: string): void {
-    this.db.tx(() => { const b = this.require(id); this.db.run('UPDATE bills SET deleted_at=NULL, updated_at=? WHERE id=?', this.now(), id); const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1; this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id); this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '恢复账单', beforeVersion, afterVersion, null, JSON.stringify({ deleted_at: { before: b.deleted_at, after: null } })); this.event(id, actor, '恢复'); this.refresh(id); });
+    return this.record(actor, '恢复账单', () => {
+    this.db.run('UPDATE bills SET deleted_at=NULL, updated_at=? WHERE id=?', this.now(), id);
+    this.event(id, actor, '恢复'); this.refresh(id);
+    });
   }
   event(id: number, actor: string, action: string, detail = ''): void {
     this.db.run('INSERT INTO events(bill_id,at,actor,action,detail) VALUES(?,?,?,?,?)', id, this.now(), actor, action, detail);
@@ -834,17 +861,36 @@ export class Store {
       refund_candidates: b.kind === 'refund' && !b.refund_of ? this.refundCandidates(id).map((r) => this.view(r)) : [],
     };
   }
-  changes(id: number, limit = 200): Row[] {
+  changes(id: number, limit?: number): Row[] {
     this.require(id);
-    return this.db.all('SELECT id,bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields FROM bill_changes WHERE bill_id=? ORDER BY id DESC LIMIT ?', id, Math.min(Math.max(limit, 1), 1000))
+    const rows = limit === undefined
+      ? this.db.all('SELECT id,bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields FROM bill_changes WHERE bill_id=? ORDER BY id DESC', id)
+      : this.db.all('SELECT id,bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields FROM bill_changes WHERE bill_id=? ORDER BY id DESC LIMIT ?', id, Math.max(limit, 1));
+    return rows
       .map((r) => ({ ...r, fields: JSON.parse(r.fields) }));
   }
   restoreChange(id: number, changeId: number, actor: string): Row {
-    const b = this.require(id), c = this.db.get<any>('SELECT * FROM bill_changes WHERE id=? AND bill_id=?', changeId, id);
-    if (!c) throw new UserError('修改记录不存在', 404);
-    const fields = JSON.parse(c.fields) as Record<string, { before: unknown; after: unknown }>;
-    const patch = Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, v.before]));
-    return this.update(id, patch, actor, false, { source: 'web', reason: `恢复修改记录 #${changeId}`, expectedVersion: Number(b.version ?? 1) });
+    return this.record(actor, `恢复修改记录 #${changeId}`, () => {
+      if (!this.db.get('SELECT id FROM bill_changes WHERE bill_id=? AND id=?', id, changeId)) throw new UserError('修改记录不存在', 404);
+      const prior: Row = {};
+      for (const row of this.db.all('SELECT fields FROM bill_changes WHERE bill_id=? AND id>=? ORDER BY id DESC', id, changeId)) {
+        for (const [key, diff] of Object.entries(JSON.parse(row.fields) as Record<string,Row>)) prior[key] = diff.before;
+      }
+      if (prior.evidence_ids) {
+        const wanted = new Set<number>(prior.evidence_ids);
+        for (const e of this.evidence(id)) if (!wanted.has(e.id)) this.setBill(e.id, null);
+        for (const ev of wanted) {
+          const owner = this.ev(ev).bill_id;
+          if (owner && owner !== id) throw new UserError('素材已移到其他账单，请先移回再恢复');
+          this.setBill(ev, id);
+        }
+      }
+      const keys = stateColumns.filter(k => k in prior);
+      if (keys.length) this.db.run(`UPDATE bills SET ${keys.map(k => k+'=?').join(',')},updated_at=? WHERE id=?`, ...keys.map(k => prior[k]), this.now(), id);
+      this.index(id);
+      this.event(id, actor, '恢复修改', '#'+changeId);
+      return {ok:true, restored_bill:id};
+    });
   }
   latestReview(id: number): Row | null {
     const r = this.db.get('SELECT id,bill_id,reviewed_at,reviewer,result,note,bill_version FROM bill_reviews WHERE bill_id=? ORDER BY id DESC LIMIT 1', id);
@@ -852,6 +898,8 @@ export class Store {
   }
   review(id: number, result: 'ok' | 'question' | 'modified', note: string, reviewer: string): Row {
     if (!['ok', 'question', 'modified'].includes(result)) throw new UserError('复核结果无效');
+    if (this.require(id).deleted_at) throw new UserError('账单已删除');
+    if (result === 'question' && !note.trim()) throw new UserError('请填写疑问说明');
     if (note.length > 5000) throw new UserError('复核说明过长');
     const b = this.require(id);
     const row = { billId: id, reviewedAt: this.now(), reviewer, result, note, billVersion: Number(b.version ?? 1) };
@@ -860,7 +908,7 @@ export class Store {
     return row;
   }
   reviewQueue(f: { from?: string; to?: string; pending?: boolean; lowConfidence?: boolean; duplicate?: boolean; never?: boolean; page?: number; pageSize?: number } = {}): { total: number; page: number; pages: number; items: Row[] } {
-    const c: string[] = ['b.deleted_at IS NULL', "b.status NOT IN ('batch','batch_done')", '(lr.id IS NULL OR lr.bill_version < b.version)'], a: any[] = [];
+    const c: string[] = ['b.deleted_at IS NULL', "b.status <> 'batch_done'", "(lr.id IS NULL OR lr.bill_version < b.version OR lr.result='question')"], a: any[] = [];
     if (f.from) { c.push('b.day>=?'); a.push(f.from); }
     if (f.to) { c.push('b.day<=?'); a.push(f.to); }
     if (f.pending) c.push("b.status='pending'");
@@ -869,7 +917,7 @@ export class Store {
     if (f.never) c.push('lr.id IS NULL');
     const where = c.join(' AND '), size = Math.min(Math.max(f.pageSize ?? 20, 1), 100), page = Math.max(f.page ?? 1, 1);
     const total = Number(this.db.get(`SELECT COUNT(*) n FROM bills b LEFT JOIN (SELECT r.* FROM bill_reviews r JOIN (SELECT bill_id,MAX(id) id FROM bill_reviews GROUP BY bill_id) x ON x.id=r.id) lr ON lr.bill_id=b.id WHERE ${where}`, ...a)!.n);
-    const items = this.db.all(`SELECT b.*,lr.reviewed_at,lr.reviewer,lr.result review_result,lr.note review_note,lr.bill_version review_version FROM bills b LEFT JOIN (SELECT r.* FROM bill_reviews r JOIN (SELECT bill_id,MAX(id) id FROM bill_reviews GROUP BY bill_id) x ON x.id=r.id) lr ON lr.bill_id=b.id WHERE ${where} ORDER BY b.updated_at DESC,b.id DESC LIMIT ? OFFSET ?`, ...a, size, (page - 1) * size).map((r) => this.view(r));
+    const items = this.db.all(`SELECT b.*,lr.reviewed_at,lr.reviewer,lr.result review_result,lr.note review_note,lr.bill_version review_version FROM bills b LEFT JOIN (SELECT r.* FROM bill_reviews r JOIN (SELECT bill_id,MAX(id) id FROM bill_reviews GROUP BY bill_id) x ON x.id=r.id) lr ON lr.bill_id=b.id WHERE ${where} ORDER BY b.occurred_at,b.id LIMIT ? OFFSET ?`, ...a, size, (page - 1) * size).map((r) => this.view(r));
     return { total, page, pages: Math.ceil(total / size), items };
   }
   counts(): Row {

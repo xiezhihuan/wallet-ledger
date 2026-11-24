@@ -125,8 +125,9 @@ export class Backups {
       this.db.run(`DELETE FROM kv WHERE key='session_secret' OR key LIKE 'qq_session:%' OR key='bind_code'`);
       for (const k of keepKv) this.db.kvSet(k.key, k.value);
       {
-        this.db.run('DELETE FROM api_tokens'); this.db.run('DELETE FROM qq_users');
-        for (const t of tokens) this.db.run('INSERT INTO api_tokens(id,name,hash,created_at,last_used_at,revoked_at) VALUES(?,?,?,?,?,?)', t.id, t.name, t.hash, t.created_at, t.last_used_at, t.revoked_at);
+        this.db.run('UPDATE mcp_authorizations SET revoked_at=COALESCE(revoked_at,?)', Date.now());
+        this.db.run('UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,?)', Date.now()); this.db.run('DELETE FROM qq_users');
+        for (const t of tokens) this.db.run('INSERT INTO api_tokens(id,name,hash,created_at,last_used_at,revoked_at,can_see_images) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,hash=excluded.hash,created_at=excluded.created_at,last_used_at=excluded.last_used_at,revoked_at=excluded.revoked_at,can_see_images=excluded.can_see_images', t.id, t.name, t.hash, t.created_at, t.last_used_at, t.revoked_at, t.can_see_images);
         for (const u of users) this.db.run('INSERT INTO qq_users(openid,nickname,bound_at) VALUES(?,?,?)', u.openid, u.nickname, u.bound_at);
       }
     });

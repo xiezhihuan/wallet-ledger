@@ -131,7 +131,7 @@ export class Importer {
   commit(id: number, o: { pick?: number[]; decide?: Record<string, string> }, actor: string): Row {
     const imp = this.get(id);
     if (imp.status !== 'preview') throw new UserError('这次导入已经处理过了');
-    return this.store.db.tx(() => {
+    return this.store.record(actor, '导入账单 #'+id, () => {
       const rows = imp.rows as ImportRow[];
       // 预览之后可能又记了新账，重新比对一次
       const before = new Map(rows.map((r) => [r.n, r.action]));
@@ -165,7 +165,7 @@ export class Importer {
       for (const m of made.filter((x) => x.row.kind === 'refund')) { this.linkRefund(m.id, m.row); this.store.refresh(m.id); }
       this.store.db.run(`UPDATE imports SET status='done', committed_at=?, rows=? WHERE id=?`, this.store.now(), JSON.stringify(rows), id);
       return { created: made.length, linked, skipped: rows.length - made.length - linked, changed, bills: made.map((m) => m.id) };
-    });
+    }, 'import');
   }
   /** 退款行找原支出：支付宝退款单号以原单号开头；微信退款与原单共用单号；都没有时不猜。 */
   private linkRefund(id: number, r: ImportRow): void {

@@ -1,3 +1,4 @@
+import { installJournal } from './journal.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
@@ -161,6 +162,10 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX bill_reviews_bill ON bill_reviews(bill_id, id DESC);
   `,
+  `ALTER TABLE mcp_write_requests ADD COLUMN fingerprint TEXT;
+   CREATE TRIGGER immutable_changes_update BEFORE UPDATE ON bill_changes BEGIN SELECT RAISE(ABORT, 'history is append-only'); END;
+   CREATE TRIGGER immutable_changes_delete BEFORE DELETE ON bill_changes BEGIN SELECT RAISE(ABORT, 'history is append-only'); END;
+  `,
 ];
 
 export class Db {
@@ -176,6 +181,7 @@ export class Db {
     if (this.file !== ':memory:') try { fs.chmodSync(this.file, 0o600); } catch { /* Windows */ }
     this.raw.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     this.migrate();
+    installJournal(this);
   }
   /** 恢复备份：关库 → 换文件 → 重新打开。fn 期间没有打开的连接。 */
   swap(fn: () => void): void {
@@ -189,7 +195,7 @@ export class Db {
     if (v > MIGRATIONS.length) throw new Error(`数据库版本 ${v} 高于程序支持的 ${MIGRATIONS.length}，请升级程序`);
     if (v > 0 && v < MIGRATIONS.length && this.file !== ':memory:' && fs.existsSync(this.file)) {
       const backup = `${this.file}.pre-migration-${Date.now()}.bak`;
-      fs.copyFileSync(this.file, backup, fs.constants.COPYFILE_EXCL);
+      this.run('VACUUM INTO ?', backup);
       try { fs.chmodSync(backup, 0o600); } catch { /* Windows */ }
     }
     for (let i = v; i < MIGRATIONS.length; i++) {
@@ -217,7 +223,18 @@ export class Db {
 
   /** 事务；可嵌套（内层并入外层）。 */
   tx<T>(fn: () => T): T {
-    if (this.depth > 0) return fn();
+    if (this.depth > 0) {
+      const savepoint = 'nested_' + this.depth++;
+      this.raw.exec('SAVEPOINT ' + savepoint);
+      try {
+        const value = fn();
+        this.raw.exec('RELEASE ' + savepoint);
+        return value;
+      } catch (err) {
+        this.raw.exec('ROLLBACK TO ' + savepoint + '; RELEASE ' + savepoint);
+        throw err;
+      } finally { this.depth--; }
+    }
     this.raw.exec('BEGIN IMMEDIATE');
     this.depth++;
     try {

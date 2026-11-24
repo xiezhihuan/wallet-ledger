@@ -1,5 +1,5 @@
 {
-  "name":"wallet-ledger-desktop","productName":"截图账本","version":"1.1.0","private":true,
+  "name":"wallet-ledger-desktop","productName":"截图账本","version":"1.2.0","private":true,
   "main":"main.cjs","scripts":{"build:mac":"node build.mjs","test:package":"node verify.mjs"},
   "devDependencies":{"@electron/packager":"20.3.0","electron":"45.4.1"}
 }

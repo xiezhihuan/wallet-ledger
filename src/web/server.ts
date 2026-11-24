@@ -1,3 +1,4 @@
+import { patchOf } from '../bill-input.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type { AddressInfo } from 'node:net';
@@ -108,18 +109,6 @@ export async function createServer({ config, store, media, intake, bot, backups,
   // ───── 账目 ─────
   app.get('/api/bills', async (req) => store.list(filter(req)));
   app.get('/api/bills/:id', async (req) => store.detail(id(req)));
-  const patchOf = (b: any): Record<string, unknown> => {
-    const p: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(b)) {
-      if (k === 'amount') p.amount = centsArg(v);
-      else if (k === 'occurred') { const m = /^(\d{4}-\d\d-\d\d)[T ](\d\d):(\d\d)$/.exec(String(v)); if (!m || !validDay(m[1]!) || +m[2]! > 23 || +m[3]! > 59) throw new UserError('时间格式不对'); p.occurred_at = at(+m[1]!.slice(0, 4), +m[1]!.slice(5, 7), +m[1]!.slice(8), +m[2]!, +m[3]!); }
-      else if (k === 'category_id' || k === 'refund_of') p[k] = v === null || v === '' ? null : Number(v);
-      else if (['kind', 'merchant', 'item', 'note', 'method', 'currency', 'trade_no', 'status'].includes(k)) p[k] = v;
-      else if (k === 'confirmed') p[k] = Boolean(v);
-      else throw new UserError(`不支持的字段：${k}`);
-    }
-    return p;
-  };
   app.patch('/api/bills/:id', async (req) => { const { learn, reason, ...b } = body(req); const r = store.update(id(req), patchOf(b), ACTOR, learn !== false, { source: 'web', reason: typeof reason === 'string' && reason.trim() ? reason.trim() : '网页修改' }); return { ...store.detail(id(req)), learned: r.rule ?? null }; });
   app.delete('/api/bills/:id', async (req) => { store.remove(id(req), ACTOR); return { ok: true }; });
   app.post('/api/bills/:id/restore', async (req) => { store.restore(id(req), ACTOR); return store.detail(id(req)); });
@@ -241,14 +230,15 @@ export async function createServer({ config, store, media, intake, bot, backups,
   app.delete('/api/mcp-authorizations/:id', async (req) => { tokens.revokeAuthorization(id(req)); return { ok: true }; });
   app.get('/api/audit/mcp', async (req) => {
     const q = req.query as any, c: string[] = ['1=1'], a: any[] = [];
-    if (q.source) { c.push('operation=?'); a.push(String(q.source)); }
-    if (q.token) { c.push('token_name=?'); a.push(String(q.token)); }
+    if (q.source) { c.push('source=?'); a.push(String(q.source)); }
+    if (q.token) { c.push('token_id=?'); a.push(Number(q.token)); }
     if (q.result) { c.push('result=?'); a.push(String(q.result)); }
-    if (q.from) { c.push('at>=?'); a.push(Date.parse(String(q.from))); }
-    if (q.to) { c.push('at<=?'); a.push(Date.parse(String(q.to))); }
-    return store.db.all(`SELECT id,at,token_id,token_name,authorization_id,bill_id,operation,result,reason,detail FROM mcp_audit WHERE ${c.join(' AND ')} ORDER BY id DESC LIMIT 500`, ...a);
+    if (q.from) { c.push('at>=?'); a.push(Date.parse(day(String(q.from)) + 'T00:00:00+08:00')); }
+    if (q.to) { c.push('at<?'); a.push(Date.parse(day(String(q.to)) + 'T00:00:00+08:00') + 86400000); }
+    return store.db.all(`SELECT * FROM (SELECT id,at,'mcp' source,token_id,token_name,authorization_id,bill_id,operation,result,reason,detail FROM mcp_audit
+      UNION ALL SELECT id,at,source,NULL,'',authorization_id,bill_id,'修改','success',reason,fields FROM bill_changes WHERE source<>'mcp') WHERE ${c.join(' AND ')} ORDER BY at DESC,id DESC LIMIT 500`, ...a);
   });
-  app.get('/api/bills/:id/changes', async (req) => store.changes(id(req), 1000));
+  app.get('/api/bills/:id/changes', async (req) => store.changes(id(req)));
   app.post('/api/bills/:id/restore-change/:changeId', async (req) => store.restoreChange(id(req), id(req, 'changeId'), ACTOR));
   app.post('/api/bills/:id/review', async (req) => { const b = body(req); return store.review(id(req), b.result, String(b.note ?? ''), ACTOR); });
 

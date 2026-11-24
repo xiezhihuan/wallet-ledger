@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import './node-version.js';
+import { loadEnvFile, readConfig, validateConfig } from './config.js';
+const { createOcr } = await import('./ocr.js');
+const { QQApi } = await import('./qq/api.js');
+loadEnvFile();
+let bad = 0;
+const check = async (name: string, fn: () => unknown) => { try { console.log(`✓ ${name}：${(await fn()) ?? '正常'}`); } catch (e) { bad++; console.log(`✗ ${name}：${(e as Error).message}`); } };
+const c = readConfig();
+await check('配置', () => { const e = validateConfig(c); if (e.length) throw new Error(e.join('；')); });
+await check('数据目录', () => { fs.mkdirSync(c.dataDir, { recursive: true, mode: 0o700 }); const f = path.join(c.dataDir, '.w'); fs.writeFileSync(f, ''); fs.rmSync(f); const s = fs.statfsSync(c.dataDir), gb = (s.bavail * s.bsize) / 1e9; if (gb < 1) throw new Error(`磁盘只剩 ${gb.toFixed(1)} GB`); return `${c.dataDir}，磁盘剩余 ${gb.toFixed(0)} GB`; });
+await check('本地文字识别', async () => { if (c.ocr && !(await createOcr())) throw new Error('不可用，截图只会保存，金额要手动补'); return c.ocr ? '可用（离线）' : '已关闭'; });
+if (c.qq.appId) { const api = new QQApi({ ...c.qq, base: c.qq.apiBase }); await check('QQ 凭据', async () => { await api.getToken(); }); await check('QQ 网关', async () => { await api.gatewayUrl(); }); await check('QQ 机器人', async () => (await api.me()).username); } else console.log('· 没有填 QQ 凭据，仅网页可用');
+process.exit(bad ? 1 : 0);

@@ -1,0 +1,45 @@
+{
+  "name": "wallet-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "截图账本：把消费截图发给 QQ 机器人就能记账，本地识别、自动分类、按周月季年统计，并通过 MCP 供 AI 只读分析",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --disable-warning=ExperimentalWarning dist/main.js",
+    "dev": "node --disable-warning=ExperimentalWarning --import tsx --watch src/main.ts",
+    "demo": "node --disable-warning=ExperimentalWarning --import tsx scripts/demo.ts",
+    "doctor": "node --disable-warning=ExperimentalWarning --import tsx src/doctor.ts",
+    "backup": "node --disable-warning=ExperimentalWarning --import tsx scripts/backup.ts",
+    "restore": "node --disable-warning=ExperimentalWarning --import tsx scripts/restore.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",
+    "test:ocr": "node --disable-warning=ExperimentalWarning --import tsx test/ocr-eval.ts",
+    "test:e2e": "node --disable-warning=ExperimentalWarning --import tsx test/e2e.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/multipart": "^10.1.9",
+    "@fastify/static": "^10.1.12",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "fastify": "^5.12.8",
+    "qrcode-generator": "^1.5.2",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "optionalDependencies": {
+    "@napi-rs/canvas": "^1.2.0",
+    "onnxruntime-node": "^1.31.1",
+    "ppu-paddle-ocr": "^6.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "playwright-core": "^1.65.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

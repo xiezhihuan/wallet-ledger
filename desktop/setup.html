@@ -1,0 +1,7 @@
+<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'"><title>截图账本 · 连接设置</title><link rel="stylesheet" href="setup.css">
+<main><h1>打开你的账本</h1><p>截图和账单保存在这台 Mac。首次使用请设置登录密码。</p>
+<form><label>登录密码<input type="password" id="password" autocomplete="new-password" placeholder="至少 8 位"></label>
+<label>本机端口<input type="number" id="port" min="1024" max="65535" required></label>
+<label class="check"><input type="checkbox" id="lan">允许同一局域网的手机访问</label>
+<details><summary>连接 QQ 机器人（选填）</summary><label>专用 AppID<input id="appId"></label><label>AppSecret<input id="secret" type="password"></label></details>
+<button id="start">打开账本</button></form><button type="button" id="demo">试用演示账本</button><p class="hint">演示密码为 demo-password，使用独立的模拟账单。</p><p role="status" id="msg"></p></main><script src="setup.js"></script></html>

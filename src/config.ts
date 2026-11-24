@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 /** 项目根目录：src/ 与 dist/ 都在根目录的下一级。 */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 export const APP = '截图账本';
 
 export interface Config {

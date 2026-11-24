@@ -1,8 +1,8 @@
 {
   "name": "wallet-ledger",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "截图账本：把消费截图发给 QQ 机器人就能记账，本地识别、自动分类、按周月季年统计，并通过 MCP 供 AI 只读分析",
+  "description": "截图账本：把消费截图发给 QQ 机器人就能记账，本地识别、自动分类、按周月季年统计，并通过 MCP 供 AI 复核与受控修改",
   "type": "module",
   "engines": {
     "node": ">=22.13"

@@ -10,10 +10,16 @@ import { fmtTime, validDay, ymd } from './time.js';
 export const KIND: Record<Kind, string> = { expense: '支出', income: '收入', refund: '退款', transfer: '转账', repay: '还款' };
 export const STATUS: Record<string, string> = { ok: '已入账', pending: '待确认', dup: '疑似重复', batch: '列表待确认', batch_done: '列表已处理' };
 export const SOURCE: Record<string, string> = { qq: 'QQ', web: '网页', import: '导入', list: '账单列表' };
-const FIELD: Record<string, string> = { amount: '金额', currency: '币种', kind: '类型', merchant: '商户', item: '说明', note: '备注', occurred_at: '时间', category_id: '分类', method: '支付方式', refund_of: '原支出', trade_no: '交易单号', direction: '方向' };
+const FIELD: Record<string, string> = { amount: '金额', currency: '币种', kind: '类型', merchant: '商户', item: '说明', note: '备注', occurred_at: '时间', category_id: '分类', method: '支付方式', refund_of: '原支出', trade_no: '交易单号', ids: '交易标识', direction: '方向', status: '待确认状态', confirmed: '确认状态' };
 
 export class UserError extends Error {
   constructor(message: string, readonly status = 400) { super(message); }
+}
+export interface UpdateOptions {
+  source?: string;
+  reason?: string;
+  expectedVersion?: number;
+  authorizationId?: number | null;
 }
 export interface NewAttachment { kind: 'image' | 'voice' | 'video' | 'file'; filename?: string; mime?: string; size?: number; url?: string; text?: string; path?: string; sha256?: string }
 export interface NewMessage { channel: 'qq' | 'web'; dedupeKey?: string; author: string; text: string; raw?: unknown; sentAt: number; attachments: NewAttachment[] }
@@ -561,11 +567,13 @@ export class Store {
 
   // ───────── 修改 ─────────
   /** 返回记住的规则（改分类时）。 */
-  update(id: number, patch: Row, actor: string, learn = true): { rule?: Row } {
+  update(id: number, patch: Row, actor: string, learn = true, options: UpdateOptions = {}): { rule?: Row; changed: string[]; version: number } {
     return this.db.tx(() => {
       const b = this.require(id), locked = new Set<string>(JSON.parse(b.locked));
+      if (options.expectedVersion !== undefined && Number(b.version ?? 1) !== options.expectedVersion) throw new UserError(`版本已变化，当前版本为 ${b.version ?? 1}，请重新读取后再改`, 409);
       if (b.status === 'batch' || b.status === 'batch_done') { if (Object.keys(patch).some((k) => k !== 'note')) throw new UserError('账单列表不能直接改，请先入账'); }
-      const out: { rule?: Row } = {};
+      const out: { rule?: Row; changed: string[]; version: number } = { changed: [], version: Number(b.version ?? 1) };
+      const changes: Record<string, { before: unknown; after: unknown }> = {};
       for (const [k, raw] of Object.entries(patch)) {
         if (!(k in FIELD)) throw new UserError(`不支持的字段：${k}`);
         let v: any = raw;
@@ -573,6 +581,8 @@ export class Store {
         else if (k === 'kind') { if (!(v in KIND)) throw new UserError('类型无效'); }
         else if (k === 'occurred_at') { if (!Number.isSafeInteger(v) || !validDay(ymd(v))) throw new UserError('时间无效'); }
         else if (k === 'category_id') { if (v !== null && !this.categories().some((c) => c.id === v)) throw new UserError('分类不存在'); }
+        else if (k === 'status') { if (!['ok', 'pending'].includes(String(v))) throw new UserError('待确认状态无效'); v = String(v); }
+        else if (k === 'confirmed') { if (typeof v !== 'boolean') throw new UserError('确认状态无效'); v = v ? 1 : 0; }
         else if (k === 'refund_of') {
           if (v !== null) {
             const o = this.require(Number(v)), kind = patch.kind ?? b.kind;
@@ -584,13 +594,16 @@ export class Store {
         } else {
           if (typeof v !== 'string') throw new UserError(`${FIELD[k]}格式错误`);
           v = v.trim();
-          if (v.length > (k === 'note' ? 5000 : 120)) throw new UserError(`${FIELD[k]}过长`);
+          if (v.length > (k === 'note' ? 5000 : k === 'ids' ? 2000 : 120)) throw new UserError(`${FIELD[k]}过长`);
           if (k === 'currency' && !/^[A-Z]{3}$/.test(v)) throw new UserError('币种应为三位字母');
           if (k === 'direction' && !['', 'in', 'out'].includes(v)) throw new UserError('方向无效');
         }
-        locked.add(k === 'currency' ? 'amount' : k);
+        if (k === 'status') { if (v === 'pending') locked.add('review'); }
+        else if (k !== 'confirmed') locked.add(k === 'currency' ? 'amount' : k);
         if (k === 'kind') locked.add('direction');
-        if (b[k] === v) continue;
+        if (b[k] === v) { if (k === 'status') throw new UserError('待确认状态没有变化'); continue; }
+        changes[k] = { before: b[k], after: v };
+        out.changed.push(k);
         this.db.run(`UPDATE bills SET ${k}=? WHERE id=?`, v, id);
         if (k === 'occurred_at') this.db.run(`UPDATE bills SET day=?, time_src='manual' WHERE id=?`, ymd(v), id);
         if (k === 'kind') this.db.run('UPDATE bills SET direction=? WHERE id=?', v === 'income' || v === 'refund' ? 'in' : 'out', id);
@@ -605,6 +618,22 @@ export class Store {
         this.event(id, '系统', '记住分类', `「${subject}」→ ${out.rule.category}`);
       }
       this.refresh(id);
+      if (patch.status === 'pending') {
+        const now = this.require(id), flags = JSON.parse(now.flags) as any[];
+        if (!flags.some((f) => f.field === 'review')) flags.push({ field: 'review', hard: true, reason: '用户标记为待确认' });
+        this.db.run('UPDATE bills SET status=\'pending\', flags=?, updated_at=? WHERE id=?', JSON.stringify(flags), this.now(), id);
+      } else if (patch.status === 'ok') {
+        const now = this.require(id), flags = (JSON.parse(now.flags) as any[]).filter((f) => f.field !== 'review');
+        this.db.run('UPDATE bills SET flags=?, status=?, confirmed=1, updated_at=? WHERE id=?', JSON.stringify(flags), now.amount === null || flags.some((f) => f.hard) ? 'pending' : 'ok', this.now(), id);
+      }
+      if (out.changed.length) {
+        const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
+        this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
+        out.version = afterVersion;
+        this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)',
+          id, this.now(), options.source ?? (actor === '网页' ? 'web' : actor === '系统' ? 'system' : actor === '导入' ? 'import' : actor === 'MCP' ? 'mcp' : 'qq'), actor,
+          options.reason ?? '修改账单', beforeVersion, afterVersion, options.authorizationId ?? null, JSON.stringify(changes));
+      }
       for (const r of this.db.all('SELECT id FROM bills WHERE refund_of=? AND deleted_at IS NULL', id)) this.refresh(r.id);
       return out;
     });
@@ -633,6 +662,9 @@ export class Store {
       const locked = new Set<string>(JSON.parse(b.locked));
       for (const k of ['amount', 'kind']) locked.add(k);
       this.db.run('UPDATE bills SET confirmed=1, locked=? WHERE id=?', JSON.stringify([...locked]), id);
+      const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
+      this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
+      this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '确认账单', beforeVersion, afterVersion, null, JSON.stringify({ confirmed: { before: b.confirmed, after: 1 } }));
       this.event(id, actor, '确认', `${KIND[b.kind as Kind]} ${money(b.amount, b.currency)}`);
       this.refresh(id);
     });
@@ -700,13 +732,16 @@ export class Store {
     try { return (JSON.parse(this.db.get('SELECT raw FROM messages WHERE id=?', messageId)?.raw ?? 'null')?.message_scene?.ext as string[] | undefined)?.find((e) => e.startsWith('msg_idx='))?.slice(8); } catch { return undefined; }
   }
   remove(id: number, actor: string): void {
-    if (this.require(id).deleted_at) return;
+    const b = this.require(id); if (b.deleted_at) return;
     this.db.run('UPDATE bills SET deleted_at=?, updated_at=? WHERE id=?', this.now(), this.now(), id);
+    const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1;
+    this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id);
+    this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '删除账单', beforeVersion, afterVersion, null, JSON.stringify({ deleted_at: { before: null, after: this.require(id).deleted_at } }));
     this.event(id, actor, '删除');
     for (const r of this.db.all(`SELECT id FROM bills WHERE dup_of=? AND deleted_at IS NULL AND status='dup'`, id)) this.refresh(r.id);
   }
   restore(id: number, actor: string): void {
-    this.db.tx(() => { this.require(id); this.db.run('UPDATE bills SET deleted_at=NULL, updated_at=? WHERE id=?', this.now(), id); this.event(id, actor, '恢复'); this.refresh(id); });
+    this.db.tx(() => { const b = this.require(id); this.db.run('UPDATE bills SET deleted_at=NULL, updated_at=? WHERE id=?', this.now(), id); const beforeVersion = Number(b.version ?? 1), afterVersion = beforeVersion + 1; this.db.run('UPDATE bills SET version=? WHERE id=?', afterVersion, id); this.db.run('INSERT INTO bill_changes(bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields) VALUES(?,?,?,?,?,?,?,?,?)', id, this.now(), actor === '网页' ? 'web' : 'qq', actor, '恢复账单', beforeVersion, afterVersion, null, JSON.stringify({ deleted_at: { before: b.deleted_at, after: null } })); this.event(id, actor, '恢复'); this.refresh(id); });
   }
   event(id: number, actor: string, action: string, detail = ''): void {
     this.db.run('INSERT INTO events(bill_id,at,actor,action,detail) VALUES(?,?,?,?,?)', id, this.now(), actor, action, detail);
@@ -794,8 +829,48 @@ export class Store {
       ...this.view(b), evidence: evs, refunds, refunded: refunds.filter((r) => r.status === 'ok').reduce((n, r) => n + r.amount, 0),
       original: b.refund_of ? this.view(this.require(b.refund_of)) : null, dup: b.dup_of ? this.view(this.require(b.dup_of)) : null,
       events: this.db.all('SELECT at,actor,action,detail FROM events WHERE bill_id=? ORDER BY id DESC', id),
+      changes: this.changes(id),
+      review: this.latestReview(id),
       refund_candidates: b.kind === 'refund' && !b.refund_of ? this.refundCandidates(id).map((r) => this.view(r)) : [],
     };
+  }
+  changes(id: number, limit = 200): Row[] {
+    this.require(id);
+    return this.db.all('SELECT id,bill_id,at,source,actor,reason,before_version,after_version,authorization_id,fields FROM bill_changes WHERE bill_id=? ORDER BY id DESC LIMIT ?', id, Math.min(Math.max(limit, 1), 1000))
+      .map((r) => ({ ...r, fields: JSON.parse(r.fields) }));
+  }
+  restoreChange(id: number, changeId: number, actor: string): Row {
+    const b = this.require(id), c = this.db.get<any>('SELECT * FROM bill_changes WHERE id=? AND bill_id=?', changeId, id);
+    if (!c) throw new UserError('修改记录不存在', 404);
+    const fields = JSON.parse(c.fields) as Record<string, { before: unknown; after: unknown }>;
+    const patch = Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, v.before]));
+    return this.update(id, patch, actor, false, { source: 'web', reason: `恢复修改记录 #${changeId}`, expectedVersion: Number(b.version ?? 1) });
+  }
+  latestReview(id: number): Row | null {
+    const r = this.db.get('SELECT id,bill_id,reviewed_at,reviewer,result,note,bill_version FROM bill_reviews WHERE bill_id=? ORDER BY id DESC LIMIT 1', id);
+    return r ? r : null;
+  }
+  review(id: number, result: 'ok' | 'question' | 'modified', note: string, reviewer: string): Row {
+    if (!['ok', 'question', 'modified'].includes(result)) throw new UserError('复核结果无效');
+    if (note.length > 5000) throw new UserError('复核说明过长');
+    const b = this.require(id);
+    const row = { billId: id, reviewedAt: this.now(), reviewer, result, note, billVersion: Number(b.version ?? 1) };
+    this.db.run('INSERT INTO bill_reviews(bill_id,reviewed_at,reviewer,result,note,bill_version) VALUES(?,?,?,?,?,?)', row.billId, row.reviewedAt, row.reviewer, row.result, row.note, row.billVersion);
+    this.event(id, reviewer, '复核', `${result}${note ? `：${note}` : ''}`);
+    return row;
+  }
+  reviewQueue(f: { from?: string; to?: string; pending?: boolean; lowConfidence?: boolean; duplicate?: boolean; never?: boolean; page?: number; pageSize?: number } = {}): { total: number; page: number; pages: number; items: Row[] } {
+    const c: string[] = ['b.deleted_at IS NULL', "b.status NOT IN ('batch','batch_done')", '(lr.id IS NULL OR lr.bill_version < b.version)'], a: any[] = [];
+    if (f.from) { c.push('b.day>=?'); a.push(f.from); }
+    if (f.to) { c.push('b.day<=?'); a.push(f.to); }
+    if (f.pending) c.push("b.status='pending'");
+    if (f.lowConfidence) c.push("b.flags<>'[]'");
+    if (f.duplicate) c.push('b.dup_of IS NOT NULL');
+    if (f.never) c.push('lr.id IS NULL');
+    const where = c.join(' AND '), size = Math.min(Math.max(f.pageSize ?? 20, 1), 100), page = Math.max(f.page ?? 1, 1);
+    const total = Number(this.db.get(`SELECT COUNT(*) n FROM bills b LEFT JOIN (SELECT r.* FROM bill_reviews r JOIN (SELECT bill_id,MAX(id) id FROM bill_reviews GROUP BY bill_id) x ON x.id=r.id) lr ON lr.bill_id=b.id WHERE ${where}`, ...a)!.n);
+    const items = this.db.all(`SELECT b.*,lr.reviewed_at,lr.reviewer,lr.result review_result,lr.note review_note,lr.bill_version review_version FROM bills b LEFT JOIN (SELECT r.* FROM bill_reviews r JOIN (SELECT bill_id,MAX(id) id FROM bill_reviews GROUP BY bill_id) x ON x.id=r.id) lr ON lr.bill_id=b.id WHERE ${where} ORDER BY b.updated_at DESC,b.id DESC LIMIT ? OFFSET ?`, ...a, size, (page - 1) * size).map((r) => this.view(r));
+    return { total, page, pages: Math.ceil(total / size), items };
   }
   counts(): Row {
     const n = (sql: string) => Number(this.db.get(`SELECT COUNT(*) n FROM bills WHERE ${sql}`)!.n);

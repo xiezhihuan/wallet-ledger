@@ -57,7 +57,7 @@ export class MockQQ {
     if (m && req.method === 'POST') {
       const fail = this.sendFailures.shift();
       if (fail) return json(fail.status, fail.body);
-      const key = body.msg_id ?? body.event_id;
+      const key = body.msg_id ?? body.event_id ?? `active:${m[1]}`;
       const used = this.replies.get(key) ?? new Set();
       if (used.has(body.msg_seq)) return json(400, { err_code: 40054005, message: '消息被去重' });
       if (used.size >= 4) return json(400, { err_code: 40034025, message: '被动回复次数超限' });

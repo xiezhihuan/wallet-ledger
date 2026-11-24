@@ -103,6 +103,64 @@ const MIGRATIONS: string[] = [
       CASE b.kind WHEN 'expense' THEN b.amount WHEN 'refund' THEN -b.amount ELSE 0 END spend
     FROM bills b LEFT JOIN bills o ON b.kind='refund' AND o.id=b.refund_of AND o.deleted_at IS NULL;
   `,
+  `
+  ALTER TABLE bills ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE api_tokens ADD COLUMN can_see_images INTEGER NOT NULL DEFAULT 1;
+  CREATE TABLE mcp_authorizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL CHECK (scope IN ('bill','all')),
+    bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+    issued_by TEXT NOT NULL,
+    issued_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER
+  );
+  CREATE INDEX mcp_authorizations_active ON mcp_authorizations(expires_at, revoked_at);
+  CREATE TABLE mcp_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    token_id INTEGER REFERENCES api_tokens(id) ON DELETE SET NULL,
+    token_name TEXT NOT NULL DEFAULT '',
+    authorization_id INTEGER REFERENCES mcp_authorizations(id) ON DELETE SET NULL,
+    bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL,
+    operation TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('success','rejected','failed')),
+    reason TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
+  );
+  CREATE INDEX mcp_audit_at ON mcp_audit(at DESC);
+  CREATE INDEX mcp_audit_bill ON mcp_audit(bill_id, at DESC);
+  CREATE TABLE mcp_write_requests (
+    request_key TEXT PRIMARY KEY,
+    bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    result TEXT NOT NULL
+  );
+  CREATE TABLE bill_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+    at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    before_version INTEGER NOT NULL,
+    after_version INTEGER NOT NULL,
+    authorization_id INTEGER REFERENCES mcp_authorizations(id) ON DELETE SET NULL,
+    fields TEXT NOT NULL
+  );
+  CREATE INDEX bill_changes_bill ON bill_changes(bill_id, id DESC);
+  CREATE TABLE bill_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_id INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+    reviewed_at INTEGER NOT NULL,
+    reviewer TEXT NOT NULL,
+    result TEXT NOT NULL CHECK (result IN ('ok','question','modified')),
+    note TEXT NOT NULL DEFAULT '',
+    bill_version INTEGER NOT NULL
+  );
+  CREATE INDEX bill_reviews_bill ON bill_reviews(bill_id, id DESC);
+  `,
 ];
 
 export class Db {
@@ -129,6 +187,11 @@ export class Db {
   private migrate(): void {
     const v = Number(this.get('PRAGMA user_version')!.user_version);
     if (v > MIGRATIONS.length) throw new Error(`数据库版本 ${v} 高于程序支持的 ${MIGRATIONS.length}，请升级程序`);
+    if (v > 0 && v < MIGRATIONS.length && this.file !== ':memory:' && fs.existsSync(this.file)) {
+      const backup = `${this.file}.pre-migration-${Date.now()}.bak`;
+      fs.copyFileSync(this.file, backup, fs.constants.COPYFILE_EXCL);
+      try { fs.chmodSync(backup, 0o600); } catch { /* Windows */ }
+    }
     for (let i = v; i < MIGRATIONS.length; i++) {
       this.tx(() => {
         this.raw.exec(MIGRATIONS[i]!);

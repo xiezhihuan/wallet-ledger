@@ -114,15 +114,16 @@ export async function createServer({ config, store, media, intake, bot, backups,
       if (k === 'amount') p.amount = centsArg(v);
       else if (k === 'occurred') { const m = /^(\d{4}-\d\d-\d\d)[T ](\d\d):(\d\d)$/.exec(String(v)); if (!m || !validDay(m[1]!) || +m[2]! > 23 || +m[3]! > 59) throw new UserError('时间格式不对'); p.occurred_at = at(+m[1]!.slice(0, 4), +m[1]!.slice(5, 7), +m[1]!.slice(8), +m[2]!, +m[3]!); }
       else if (k === 'category_id' || k === 'refund_of') p[k] = v === null || v === '' ? null : Number(v);
-      else if (['kind', 'merchant', 'item', 'note', 'method', 'currency', 'trade_no'].includes(k)) p[k] = v;
+      else if (['kind', 'merchant', 'item', 'note', 'method', 'currency', 'trade_no', 'status'].includes(k)) p[k] = v;
+      else if (k === 'confirmed') p[k] = Boolean(v);
       else throw new UserError(`不支持的字段：${k}`);
     }
     return p;
   };
-  app.patch('/api/bills/:id', async (req) => { const { learn, ...b } = body(req); const r = store.update(id(req), patchOf(b), ACTOR, learn !== false); return { ...store.detail(id(req)), learned: r.rule ?? null }; });
+  app.patch('/api/bills/:id', async (req) => { const { learn, reason, ...b } = body(req); const r = store.update(id(req), patchOf(b), ACTOR, learn !== false, { source: 'web', reason: typeof reason === 'string' && reason.trim() ? reason.trim() : '网页修改' }); return { ...store.detail(id(req)), learned: r.rule ?? null }; });
   app.delete('/api/bills/:id', async (req) => { store.remove(id(req), ACTOR); return { ok: true }; });
   app.post('/api/bills/:id/restore', async (req) => { store.restore(id(req), ACTOR); return store.detail(id(req)); });
-  app.post('/api/bills/:id/confirm', async (req) => { const b = body(req); if (Object.keys(b).length) store.update(id(req), patchOf(b), ACTOR); store.confirm(id(req), ACTOR); return store.detail(id(req)); });
+  app.post('/api/bills/:id/confirm', async (req) => { const b = body(req); if (Object.keys(b).length) store.update(id(req), patchOf(b), ACTOR, true, { source: 'web', reason: '网页确认' }); store.confirm(id(req), ACTOR); return store.detail(id(req)); });
   app.post('/api/bills/:id/dup', async (req) => ({ id: store.resolveDup(id(req), body(req).same === true, ACTOR) }));
   app.post('/api/bills/:id/merge', async (req) => { store.merge(id(req), Number(body(req).into), ACTOR); return { ok: true }; });
   app.post('/api/bills/:id/commit', async (req) => { const p = body(req).rows; if (p !== undefined && p !== null && !(Array.isArray(p) && p.every((x) => Number.isInteger(x)))) throw new UserError('行号无效'); return store.commitBatch(id(req), p ?? null, ACTOR); });
@@ -229,22 +230,41 @@ export async function createServer({ config, store, media, intake, bot, backups,
   app.post('/api/backups/:name/restore', async (req) => { if (media.processing || store.db.get('SELECT 1 FROM receipts_due LIMIT 1')) throw new UserError('正在收录消息，请稍后恢复', 409); const r = backups.restore((req.params as any).name); store.resetCaches(); media.kick(); return r; });
 
   // ───── MCP ─────
-  registerMcp(app, { store, media, tokens });
-  app.post('/api/mcp-tokens', async (req) => tokens.create(String(body(req).name ?? '')));
+  registerMcp(app, { store, media, tokens, notify: bot?.notifyMcp.bind(bot) });
+  app.post('/api/mcp-tokens', async (req) => tokens.create(String(body(req).name ?? ''), body(req).can_see_images !== false));
   app.delete('/api/mcp-tokens/:id', async (req) => { tokens.revoke(id(req)); return { ok: true }; });
+  app.get('/api/mcp-authorizations', async () => tokens.authorizations());
+  app.post('/api/mcp-authorizations', async (req) => {
+    const b = body(req), scope = b.scope === 'all' ? 'all' : 'bill';
+    return tokens.issueAuthorization(scope, scope === 'bill' ? Number(b.bill_id) : null, '网页管理员', Number(b.minutes ?? 10));
+  });
+  app.delete('/api/mcp-authorizations/:id', async (req) => { tokens.revokeAuthorization(id(req)); return { ok: true }; });
+  app.get('/api/audit/mcp', async (req) => {
+    const q = req.query as any, c: string[] = ['1=1'], a: any[] = [];
+    if (q.source) { c.push('operation=?'); a.push(String(q.source)); }
+    if (q.token) { c.push('token_name=?'); a.push(String(q.token)); }
+    if (q.result) { c.push('result=?'); a.push(String(q.result)); }
+    if (q.from) { c.push('at>=?'); a.push(Date.parse(String(q.from))); }
+    if (q.to) { c.push('at<=?'); a.push(Date.parse(String(q.to))); }
+    return store.db.all(`SELECT id,at,token_id,token_name,authorization_id,bill_id,operation,result,reason,detail FROM mcp_audit WHERE ${c.join(' AND ')} ORDER BY id DESC LIMIT 500`, ...a);
+  });
+  app.get('/api/bills/:id/changes', async (req) => store.changes(id(req), 1000));
+  app.post('/api/bills/:id/restore-change/:changeId', async (req) => store.restoreChange(id(req), id(req, 'changeId'), ACTOR));
+  app.post('/api/bills/:id/review', async (req) => { const b = body(req); return store.review(id(req), b.result, String(b.note ?? ''), ACTOR); });
 
   // ───── 设置 ─────
   app.get('/api/system', async () => ({
     bot: bot ? { state: bot.gateway.state, reason: bot.gateway.reason, lastEventAt: bot.gateway.lastEventAt } : { state: 'disabled', reason: '没有配置 QQ 机器人', lastEventAt: 0 },
     ocr: media.ocr ? 'ready' : config.ocr ? 'unavailable' : 'disabled',
     queue: store.db.get(`SELECT COALESCE(SUM(status='pending'),0) downloading, COALESCE(SUM(status='failed'),0) failed, COALESCE(SUM(status='done' AND ocr_status='pending'),0) recognizing FROM attachments`),
-    users: store.db.all('SELECT openid,nickname,bound_at FROM qq_users ORDER BY bound_at'), tokens: tokens.list(), access: accessUrls(config, (app.server.address() as AddressInfo).port), lan: !isLoopback(config.host), publicUrl: config.publicUrl,
-    settings: { merge_window_min: intake.mergeWindowMs / 60_000, refund_basis: store.basis }, startedAt, dataDir: config.dataDir, demo: !!demo, version: VERSION, backups: backups.list().slice(0, 1), backupDir: backups.dir,
+    users: store.db.all('SELECT openid,nickname,bound_at FROM qq_users ORDER BY bound_at'), tokens: tokens.list(), authorizations: tokens.authorizations(), access: accessUrls(config, (app.server.address() as AddressInfo).port), lan: !isLoopback(config.host), publicUrl: config.publicUrl,
+    settings: { merge_window_min: intake.mergeWindowMs / 60_000, refund_basis: store.basis }, mcp_notify_qq: store.setting('mcp_notify_qq', '1') !== '0', startedAt, dataDir: config.dataDir, demo: !!demo, version: VERSION, backups: backups.list().slice(0, 1), backupDir: backups.dir,
   }));
   app.post('/api/settings', async (req) => {
     const b = body(req);
     if (b.merge_window_min !== undefined) { const n = Number(b.merge_window_min); if (!Number.isFinite(n) || n < 0 || n > 120) throw new UserError('合并窗口须为 0–120 分钟'); store.saveSetting('merge_window_min', String(n)); }
     if (b.refund_basis !== undefined) { if (!['original', 'refund'].includes(b.refund_basis)) throw new UserError('退款归属无效'); store.saveSetting('refund_basis', b.refund_basis); }
+    if (b.mcp_notify_qq !== undefined) store.saveSetting('mcp_notify_qq', b.mcp_notify_qq ? '1' : '0');
     return { ok: true };
   });
   app.post('/api/bind-code', async () => store.createBindCode());

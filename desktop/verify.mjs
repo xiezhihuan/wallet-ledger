@@ -10,9 +10,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(fileURLToPath(import.meta.url)), out = path.join(here,'../test-output');
+const here = path.dirname(fileURLToPath(import.meta.url)), out = path.join(here,'../test-output'), version = JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')).version;
 const temp = fs.mkdtempSync(path.join(os.tmpdir(),'ledger-package-')), mount = path.join(temp,'volume'), profile = path.join(temp,'profile');
-const dmg = path.resolve(process.argv[2] || path.join(here,'release','WalletLedger-1.0.0-'+process.arch+'.dmg'));
+const dmg = path.resolve(process.argv[2] || path.join(here,'release',`WalletLedger-${version}-${process.arch}.dmg`));
 fs.mkdirSync(mount); fs.mkdirSync(out,{recursive:true});
 let mounted = false, app;
 const launch = async () => electron.launch({ executablePath: path.join(mount,'截图账本.app/Contents/MacOS/WalletLedger'),

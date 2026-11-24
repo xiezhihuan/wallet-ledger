@@ -76,4 +76,9 @@ export class QQApi {
     });
     return data?.ext_info?.ref_idx;
   }
+
+  /** 主动发送单聊通知，不依赖某条用户消息的被动回复窗口。 */
+  async sendC2C(openid: string, content: string, seq: number): Promise<void> {
+    await this.call('POST', `/v2/users/${encodeURIComponent(openid)}/messages`, { msg_type: 0, content, msg_seq: seq });
+  }
 }

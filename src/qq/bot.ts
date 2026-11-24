@@ -1,6 +1,8 @@
 import { HELP, type Intake } from '../intake.js';
 import { logger } from '../log.js';
+import { money } from '../money.js';
 import type { Media } from '../media.js';
+import { fmtTime } from '../time.js';
 import type { Store } from '../store.js';
 import type { QQApi } from './api.js';
 import { Gateway, type Payload, type Session } from './gateway.js';
@@ -18,6 +20,7 @@ export class Bot {
   private sent = new Map<string, { openid: string; msgId: string; at: number; n: number }>();
   private told = new Map<number, string>();
   private inflight = new Set<Promise<unknown>>();
+  private notifySeq = 0;
   private stopped = false;
 
   constructor(private o: { appId: string; api: QQApi; store: Store; intake: Intake; media: Media; dataDir: string; receiptDelayMs: number; backoff?: number[] }) {
@@ -43,6 +46,24 @@ export class Bot {
       this.schedule(d.openid, d.capture, d.msg_id, bills, []);
     }
     this.gateway.start();
+  }
+
+  /** MCP 修改成功后的简短主动通知。没有绑定 QQ 时静默跳过。 */
+  async notifyMcp(billId: number, fields: Record<string, { before: unknown; after: unknown }>): Promise<void> {
+    if (this.o.store.setting('mcp_notify_qq', '1') === '0') return;
+    const users = this.o.store.db.all<{ openid: string }>('SELECT openid FROM qq_users ORDER BY bound_at');
+    if (!users.length) return;
+    const names: Record<string, string> = { amount: '金额', currency: '币种', kind: '类型', merchant: '商户', item: '说明', note: '备注', occurred_at: '时间', category_id: '分类', method: '支付方式', trade_no: '交易单号', status: '待确认状态', confirmed: '确认状态', refund_of: '退款关联' };
+    const value = (key: string, v: unknown): string => {
+      if (v === null || v === undefined || v === '') return '空';
+      if (key === 'amount' && typeof v === 'number') return money(v, 'CNY');
+      if (key === 'category_id' && typeof v === 'number') return this.o.store.categoryName(v);
+      if (key === 'occurred_at' && typeof v === 'number') return fmtTime(v);
+      return String(v).slice(0, 80);
+    };
+    const lines = Object.entries(fields).map(([key, change]) => `${names[key] ?? key}：${value(key, change.before)} → ${value(key, change.after)}`);
+    const text = sanitizeReply(`✅ MCP 已修改 #${billId}\n${lines.join('\n')}`);
+    await Promise.allSettled(users.map((u, i) => this.o.api.sendC2C(u.openid, text, ++this.notifySeq + i)));
   }
   /** 停机：没发的回执留在库里，下次启动补发。 */
   async stop(): Promise<void> {

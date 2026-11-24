@@ -146,7 +146,11 @@ export class Importer {
           const b = this.store.require(r.match), ids = JSON.parse(b.ids) as { type: string; no: string }[];
           for (const [type, no] of [['trade', r.trade_no], ['mch', r.mch_no]] as const) if (no && !ids.some((i) => i.no === no)) ids.push({ type, no });
           // 只补空白字段，不改用户已有的内容
-          this.store.db.run(`UPDATE bills SET ids=?, trade_no=CASE WHEN trade_no='' THEN ? ELSE trade_no END, merchant=CASE WHEN merchant='' THEN ? ELSE merchant END, method=CASE WHEN method='' THEN ? ELSE method END, locked=? WHERE id=?`, JSON.stringify(ids), r.trade_no, r.merchant, r.method, JSON.stringify([...new Set([...JSON.parse(b.locked), 'trade_no', 'merchant', 'method'])]), b.id);
+          const patch: Row = { ids: JSON.stringify(ids) };
+          if (!b.trade_no && r.trade_no) patch.trade_no = r.trade_no;
+          if (!b.merchant && r.merchant) patch.merchant = r.merchant;
+          if (!b.method && r.method) patch.method = r.method;
+          if (Object.keys(patch).length) this.store.update(b.id, patch, actor, false, { source: 'import', reason: `导入${imp.platform === 'wechat' ? '微信' : '支付宝'}账单补全` });
           this.store.event(b.id, actor, '与导入账单对上', `${imp.platform === 'wechat' ? '微信' : '支付宝'} ${fmtTime(r.time)}`);
           linked++; continue;
         }
@@ -167,7 +171,7 @@ export class Importer {
   private linkRefund(id: number, r: ImportRow): void {
     const cands = this.store.db.all(`SELECT id,ids FROM bills WHERE kind='expense' AND deleted_at IS NULL AND status IN ('ok','pending') AND amount>=? AND occurred_at<=?`, r.amount, r.time + 60_000);
     const hit = cands.find((b) => (JSON.parse(b.ids) as { no: string }[]).some((i) => i.no.length >= 8 && (r.trade_no.startsWith(i.no) || (!!r.mch_no && i.no === r.mch_no))));
-    if (hit && this.store.refundable(hit.id, id) >= r.amount) { this.store.db.run('UPDATE bills SET refund_of=? WHERE id=?', hit.id, id); this.store.event(id, '系统', '关联原支出', `单号对应 → #${hit.id}`); }
+    if (hit && this.store.refundable(hit.id, id) >= r.amount) { this.store.update(id, { refund_of: hit.id }, '导入', false, { source: 'import', reason: '导入账单关联原支出' }); this.store.event(id, '系统', '关联原支出', `单号对应 → #${hit.id}`); }
   }
   discard(id: number): void { this.get(id); this.store.db.run(`UPDATE imports SET status='discarded' WHERE id=? AND status='preview'`, id); }
 }
